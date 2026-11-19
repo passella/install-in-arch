@@ -42,12 +42,25 @@ O `install-in-arch` lê pacotes Debian (`.deb`) e RPM (`.rpm`) diretamente em *s
 
 - **Sistema operacional:** Arch Linux ou derivada com `pacman` instalado.
 - **Privilégios:** `sudo` configurado (quando executado por usuário comum, o `install-in-arch` invoca `sudo pacman ...`; quando executado como `root`, invoca `pacman` diretamente).
-- **Toolchain Rust:** `rustc` e `cargo` com suporte à **Rust Edition 2024**.
+- **Toolchain Rust:** `rustc` e `cargo` com suporte à **Rust Edition 2024** (apenas para compilação a partir do código-fonte).
+
+### Instalação rápida via binário pré-compilado (Release)
+
+Baixe o binário estático Linux (`musl`, compatível com qualquer Arch Linux e derivadas independentemente da versão da `glibc`) para `x86_64` (`install-in-arch-linux-x86_64`) ou `aarch64` (`install-in-arch-linux-aarch64`) mais recente diretamente da página de [Releases](https://github.com/passella/install-in-arch/releases/latest) (também disponíveis como arquivos `install-in-arch-<TAG>-x86_64-unknown-linux-musl.tar.gz` e `install-in-arch-<TAG>-aarch64-unknown-linux-musl.tar.gz`, acompanhados de `SHA256SUMS.txt` para verificação de integridade):
+
+```bash
+curl -fsSLO https://github.com/passella/install-in-arch/releases/latest/download/install-in-arch-linux-x86_64
+curl -fsSLO https://github.com/passella/install-in-arch/releases/latest/download/SHA256SUMS.txt
+sha256sum -c SHA256SUMS.txt --ignore-missing
+sudo install -Dm755 install-in-arch-linux-x86_64 /usr/local/bin/install-in-arch
+```
+
+*(Em sistemas ARM64, substitua `install-in-arch-linux-x86_64` por `install-in-arch-linux-aarch64`.)*
 
 ### Instalação a partir do código-fonte
 
 ```bash
-git clone <url-do-repositorio>
+git clone https://github.com/passella/install-in-arch.git
 cd install-in-arch
 cargo install --path .
 ```

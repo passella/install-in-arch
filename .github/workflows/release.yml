@@ -1,0 +1,356 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Format, Clippy & Tests
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Generate release tag
+        id: meta
+        run: echo "tag=$(date -u +'%Y%m%d%H%M%S')" >> "${GITHUB_OUTPUT}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+  build:
+    name: Build Static Musl (${{ matrix.target }})
+    needs: [check]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            bin_name: install-in-arch-linux-x86_64
+            cc_env: CC_x86_64_unknown_linux_musl
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            bin_name: install-in-arch-linux-aarch64
+            cc_env: CC_aarch64_unknown_linux_musl
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build static musl release binary and package assets
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          BIN_NAME: ${{ matrix.bin_name }}
+          CC_ENV_VAR: ${{ matrix.cc_env }}
+        run: |
+          set -euo pipefail
+          export "${CC_ENV_VAR}=musl-gcc"
+          export RUSTFLAGS="-C target-feature=+crt-static"
+
+          cargo build --release --locked --target "${TARGET}"
+
+          BIN_PATH="target/${TARGET}/release/install-in-arch"
+          strip "${BIN_PATH}"
+
+          file "${BIN_PATH}"
+          file "${BIN_PATH}" | grep -iE 'static|statically'
+          "${BIN_PATH}" --version
+
+          rm -rf dist staging
+          mkdir -p dist staging
+
+          install -m 0755 "${BIN_PATH}" staging/install-in-arch
+          cp README.md staging/README.md
+          tar -czf "dist/install-in-arch-${TAG}-${TARGET}.tar.gz" -C staging install-in-arch README.md
+
+          install -m 0755 "${BIN_PATH}" "dist/${BIN_NAME}"
+          ls -lh dist/
+
+      - name: Upload target artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  smoke-archlinux:
+    name: Smoke Test Static Musl on Arch Linux
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+
+    steps:
+      - name: Download x86_64 musl artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: x86_64-unknown-linux-musl
+          path: dist
+
+      - name: Validate static musl binary, tarball and synthetic .deb against real pacman
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          chmod +x dist/install-in-arch-linux-x86_64
+          ./dist/install-in-arch-linux-x86_64 --version
+          ./dist/install-in-arch-linux-x86_64 --help
+          ./dist/install-in-arch-linux-x86_64 --list
+
+          rm -rf /tmp/smoke_tar /tmp/smoke_deb /tmp/smoke_out /tmp/smoke.deb
+          mkdir -p /tmp/smoke_tar /tmp/smoke_deb/ctrl /tmp/smoke_deb/data/usr/bin /tmp/smoke_out
+
+          tar -xzf "dist/install-in-arch-${TAG}-x86_64-unknown-linux-musl.tar.gz" -C /tmp/smoke_tar
+          test -f /tmp/smoke_tar/README.md
+          test -x /tmp/smoke_tar/install-in-arch
+          /tmp/smoke_tar/install-in-arch --version
+          /tmp/smoke_tar/install-in-arch --help
+          /tmp/smoke_tar/install-in-arch --list
+
+          printf '2.0\n' > /tmp/smoke_deb/debian-binary
+          printf 'Package: smoke-test\nVersion: 1.0.0\nArchitecture: amd64\nDescription: Smoke test package\n' > /tmp/smoke_deb/ctrl/control
+          printf '#!/bin/sh\necho smoke\n' > /tmp/smoke_deb/data/usr/bin/smoke-test
+          chmod 0755 /tmp/smoke_deb/data/usr/bin/smoke-test
+          tar -czf /tmp/smoke_deb/control.tar.gz -C /tmp/smoke_deb/ctrl control
+          tar -czf /tmp/smoke_deb/data.tar.gz -C /tmp/smoke_deb/data usr
+          bsdtar --format=arsvr4 -cf /tmp/smoke.deb -C /tmp/smoke_deb debian-binary control.tar.gz data.tar.gz
+
+          /tmp/smoke_tar/install-in-arch --dry-run --ignore-deps --keep-pkg /tmp/smoke_out /tmp/smoke.deb
+          PKG_FILE="/tmp/smoke_out/smoke-test-1.0.0-1-x86_64.pkg.tar.zst"
+          test -f "${PKG_FILE}"
+          pacman -Qpi "${PKG_FILE}"
+          pacman -Qpl "${PKG_FILE}"
+          pacman -Qpl "${PKG_FILE}" | grep -qx 'smoke-test /usr/bin/smoke-test'
+
+      - name: Validate synthetic .rpm against real pacman
+        run: |
+          set -euo pipefail
+          if [ ! -d /etc/pacman.d/gnupg ]; then
+            pacman-key --init
+            pacman-key --populate archlinux
+          fi
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -S --noconfirm rpm-tools
+
+          rm -rf /tmp/rpmbuild /tmp/smoke_rpm_out
+          mkdir -p /tmp/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS} /tmp/smoke_rpm_out
+
+          cat <<'SPEC' > /tmp/rpmbuild/SPECS/smoke-rpm.spec
+          %global debug_package %{nil}
+          Name: smoke-rpm
+          Version: 1.0.0
+          Release: 1
+          Summary: Smoke test RPM package
+          License: MIT
+          BuildArch: x86_64
+
+          %description
+          Synthetic RPM package for Arch Linux smoke validation.
+
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          printf '#!/bin/sh\necho smoke-rpm\n' > %{buildroot}/usr/bin/smoke-rpm
+          chmod 0755 %{buildroot}/usr/bin/smoke-rpm
+
+          %files
+          /usr/bin/smoke-rpm
+          SPEC
+
+          rpmbuild -bb --define "_topdir /tmp/rpmbuild" /tmp/rpmbuild/SPECS/smoke-rpm.spec
+          RPM_FILE="/tmp/rpmbuild/RPMS/x86_64/smoke-rpm-1.0.0-1.x86_64.rpm"
+          test -f "${RPM_FILE}"
+
+          /tmp/smoke_tar/install-in-arch --dry-run --ignore-deps --keep-pkg /tmp/smoke_rpm_out "${RPM_FILE}"
+          PKG_FILE="/tmp/smoke_rpm_out/smoke-rpm-1.0.0-1-x86_64.pkg.tar.zst"
+          test -f "${PKG_FILE}"
+          pacman -Qpi "${PKG_FILE}"
+          pacman -Qpl "${PKG_FILE}"
+          pacman -Qpl "${PKG_FILE}" | grep -qx 'smoke-rpm /usr/bin/smoke-rpm'
+
+  smoke-aarch64:
+    name: Smoke Test Static Musl (aarch64)
+    needs: [check, build]
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Download aarch64 musl artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: aarch64-unknown-linux-musl
+          path: dist
+
+      - name: Validate static musl binary, tarball and synthetic .deb on aarch64
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          chmod +x dist/install-in-arch-linux-aarch64
+          ./dist/install-in-arch-linux-aarch64 --version
+          ./dist/install-in-arch-linux-aarch64 --help
+
+          rm -rf /tmp/smoke_arm_tar /tmp/smoke_arm_deb /tmp/smoke_arm_out /tmp/smoke_arm.deb
+          mkdir -p /tmp/smoke_arm_tar /tmp/smoke_arm_deb/ctrl /tmp/smoke_arm_deb/data/usr/bin /tmp/smoke_arm_out
+
+          tar -xzf "dist/install-in-arch-${TAG}-aarch64-unknown-linux-musl.tar.gz" -C /tmp/smoke_arm_tar
+          test -f /tmp/smoke_arm_tar/README.md
+          test -x /tmp/smoke_arm_tar/install-in-arch
+          /tmp/smoke_arm_tar/install-in-arch --version
+          /tmp/smoke_arm_tar/install-in-arch --help
+
+          printf '2.0\n' > /tmp/smoke_arm_deb/debian-binary
+          printf 'Package: smoke-arm\nVersion: 1.0.0\nArchitecture: arm64\nDescription: Smoke test ARM64 package\n' > /tmp/smoke_arm_deb/ctrl/control
+          printf '#!/bin/sh\necho smoke-arm\n' > /tmp/smoke_arm_deb/data/usr/bin/smoke-arm
+          chmod 0755 /tmp/smoke_arm_deb/data/usr/bin/smoke-arm
+          tar -czf /tmp/smoke_arm_deb/control.tar.gz -C /tmp/smoke_arm_deb/ctrl control
+          tar -czf /tmp/smoke_arm_deb/data.tar.gz -C /tmp/smoke_arm_deb/data usr
+          (
+            cd /tmp/smoke_arm_deb
+            ar rcs /tmp/smoke_arm.deb debian-binary control.tar.gz data.tar.gz
+          )
+
+          /tmp/smoke_arm_tar/install-in-arch --dry-run --ignore-deps --keep-pkg /tmp/smoke_arm_out /tmp/smoke_arm.deb
+          PKG_FILE="/tmp/smoke_arm_out/smoke-arm-1.0.0-1-aarch64.pkg.tar.zst"
+          test -s "${PKG_FILE}"
+          ls -lh "${PKG_FILE}"
+
+  publish:
+    name: Publish GitHub Release
+    needs: [check, build, smoke-archlinux, smoke-aarch64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate unified SHA256SUMS.txt
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            sha256sum \
+              "install-in-arch-${TAG}-x86_64-unknown-linux-musl.tar.gz" \
+              "install-in-arch-${TAG}-aarch64-unknown-linux-musl.tar.gz" \
+              "install-in-arch-linux-x86_64" \
+              "install-in-arch-linux-aarch64" \
+              > SHA256SUMS.txt
+          )
+          ls -lh dist/
+          cat dist/SHA256SUMS.txt
+
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -f /tmp/pr.json /tmp/release_notes.md
+          gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" > /tmp/pr.json || true
+
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          pr_json_path = "/tmp/pr.json"
+          notes_path = "/tmp/release_notes.md"
+          notes = ""
+
+          if os.path.exists(pr_json_path) and os.path.getsize(pr_json_path) > 0:
+              try:
+                  with open(pr_json_path, "r", encoding="utf-8") as fh:
+                      data = json.load(fh)
+                  if isinstance(data, list):
+                      merged = [p for p in data if p.get("merged_at")]
+                      pr = merged[0] if merged else (data[0] if data else None)
+                  elif isinstance(data, dict):
+                      pr = data
+                  else:
+                      pr = None
+                  if pr:
+                      title = (pr.get("title") or "").strip()
+                      body = (pr.get("body") or "").strip()
+                      if body:
+                          notes = f"## {title}\n\n{body}\n" if title else f"{body}\n"
+              except Exception:
+                  notes = ""
+
+          if not notes.strip():
+              notes = subprocess.check_output(
+                  ["git", "log", "-1", "--pretty=%B"],
+                  text=True,
+              )
+
+          with open(notes_path, "w", encoding="utf-8") as fh:
+              fh.write(notes)
+          PY
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "${TAG}" dist/* \
+            --title "${TAG}" \
+            --notes-file /tmp/release_notes.md \
+            --target "${GITHUB_SHA}"

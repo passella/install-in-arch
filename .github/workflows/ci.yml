@@ -46,7 +46,7 @@ jobs:
   archlinux-smoke:
     name: Arch Linux Real Pacman Smoke & Integration Tests
     runs-on: ubuntu-latest
-    container: archlinux:latest
+    container: archlinux@sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899
 
     steps:
       - name: Checkout repository

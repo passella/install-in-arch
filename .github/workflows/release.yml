@@ -126,7 +126,7 @@ jobs:
     name: Smoke Test Static Musl on Arch Linux
     needs: [check, build]
     runs-on: ubuntu-24.04
-    container: archlinux:latest
+    container: archlinux@sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899
 
     steps:
       - name: Download x86_64 musl artifact

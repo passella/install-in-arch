@@ -235,17 +235,19 @@ mod tests {
     #[test]
     fn sanitizes_single_line_homepage_and_license_against_header_injection()
     -> Result<(), DomainError> {
-        let raw = "\
-Package: demo
-Version: 1.0
-Architecture: amd64
-Homepage: https://example.org
- packager = attacker
-License: MIT
- depend = evil
-Description: Line one
-";
-        let meta = parse_control_file(raw, Vec::new())?;
+        let raw = [
+            "Package: demo",
+            "Version: 1.0",
+            "Architecture: amd64",
+            "Homepage: https://example.org",
+            " packager = attacker",
+            "License: MIT",
+            " depend = evil",
+            "Description: Line one",
+            "",
+        ]
+        .join("\n");
+        let meta = parse_control_file(&raw, Vec::new())?;
         assert_eq!(
             meta.homepage.as_deref(),
             Some("https://example.org packager = attacker")
@@ -260,20 +262,22 @@ Description: Line one
 
     #[test]
     fn parses_multiline_description_depends_and_maintainer_scripts() -> Result<(), DomainError> {
-        let raw = "\
-Package: epic-games-launcher
-Version: 1.2.3-1
-Architecture: amd64
-Homepage: https://example.org/launcher
-Depends: libwebkit2gtk-4.1-0 (>= 2.40), libgtk-3-0:amd64 | libgtk-4-1, libc6
-Pre-Depends: zlib1g (>= 1:1.1.4)
-Description: Epic Launcher Wrapper
- Detailed line one
- .
- Detailed line two
-";
+        let raw = [
+            "Package: epic-games-launcher",
+            "Version: 1.2.3-1",
+            "Architecture: amd64",
+            "Homepage: https://example.org/launcher",
+            "Depends: libwebkit2gtk-4.1-0 (>= 2.40), libgtk-3-0:amd64 | libgtk-4-1, libc6",
+            "Pre-Depends: zlib1g (>= 1:1.1.4)",
+            "Description: Epic Launcher Wrapper",
+            " Detailed line one",
+            " .",
+            " Detailed line two",
+            "",
+        ]
+        .join("\n");
 
-        let meta = parse_control_file(raw, vec!["postinst".to_string()])?;
+        let meta = parse_control_file(&raw, vec!["postinst".to_string()])?;
         assert_eq!(meta.package, "epic-games-launcher");
         assert_eq!(meta.version, "1.2.3-1");
         assert_eq!(meta.architecture, "amd64");

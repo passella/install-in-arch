@@ -53,6 +53,9 @@ pub enum DomainError {
         context: String,
     },
 
+    #[error("external command '{command}' failed: executable '{executable}' not found")]
+    ExecutableNotFound { command: String, executable: String },
+
     #[error("external command '{command}' failed: {reason}")]
     CommandExecutionFailed { command: String, reason: String },
 
@@ -108,6 +111,13 @@ impl DomainError {
                 resource: sanitize_for_error(&resource),
                 limit,
                 context: sanitize_for_error(&context),
+            },
+            Self::ExecutableNotFound {
+                command,
+                executable,
+            } => Self::ExecutableNotFound {
+                command: sanitize_for_error(&command),
+                executable: sanitize_for_error(&executable),
             },
             Self::CommandExecutionFailed { command, reason } => Self::CommandExecutionFailed {
                 command: sanitize_for_error(&command),

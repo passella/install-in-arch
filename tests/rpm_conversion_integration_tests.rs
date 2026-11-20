@@ -1250,3 +1250,156 @@ fn enforces_rpm_payload_uncompressed_quota_and_prevalidation_bounds()
 
     Ok(())
 }
+
+struct MissingPacmanRunner;
+
+impl install_in_arch::adapters::outbound::system_process::CommandRunnerPort
+    for MissingPacmanRunner
+{
+    fn run_capture(
+        &self,
+        program: &str,
+        args: &[&str],
+        _env: &[(&str, &str)],
+    ) -> Result<install_in_arch::adapters::outbound::system_process::CommandOutput, DomainError>
+    {
+        Err(DomainError::ExecutableNotFound {
+            command: format!("{program} {}", args.join(" ")),
+            executable: program.to_string(),
+        })
+    }
+
+    fn run_interactive(
+        &self,
+        program: &str,
+        args: &[&str],
+        _env: &[(&str, &str)],
+    ) -> Result<i32, DomainError> {
+        Err(DomainError::ExecutableNotFound {
+            command: format!("{program} {}", args.join(" ")),
+            executable: program.to_string(),
+        })
+    }
+}
+
+struct NonRootPrivileges;
+
+impl install_in_arch::adapters::outbound::system_process::PrivilegeDetectorPort
+    for NonRootPrivileges
+{
+    fn is_root(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn cli_rpm_dry_run_ignore_deps_succeeds_without_pacman_and_filters_protected_packages()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let out_dir = dir.path().join("rpm_smoke_out");
+    let rpm_path = dir.path().join("smoke-rpm-1.0.0-1.aarch64.rpm");
+
+    let pkg = PackageBuilder::new(
+        "smoke-rpm",
+        "1.0.0",
+        "MIT",
+        "aarch64",
+        "Smoke RPM conversion without pacman",
+    )
+    .release("1")
+    .using_config(BuildConfig::v4().compression(CompressionType::Zstd))
+    .requires(Dependency::any("libc.so.6(GLIBC_2.34)(64bit)"))
+    .conflicts(Dependency::any("glibc"))
+    .conflicts(Dependency::any("pacman"))
+    .conflicts(Dependency::any("systemd"))
+    .conflicts(Dependency::any("smoke-rpm-legacy"))
+    .obsoletes(Dependency::any("bash"))
+    .obsoletes(Dependency::any("smoke-rpm-old"))
+    .with_file_contents(
+        b"#!/bin/sh\necho rpm-smoke\n".as_slice(),
+        FileOptions::new("/usr/bin/smoke-rpm").permissions(0o755),
+    )?
+    .build()?;
+    pkg.write_file(&rpm_path)?;
+
+    let adapter = MultiFormatPackageAdapter::new();
+    let missing_runner = MissingPacmanRunner;
+    let non_root = NonRootPrivileges;
+    let pacman_adapter = PacmanAdapter::new(&missing_runner, &non_root);
+    let clock = FixedClock(1_700_000_000);
+
+    let inspectors: [&dyn SourcePackageInspectorPort; 1] = [&adapter];
+    let converters: [&dyn ArchPackageConverterPort; 1] = [&adapter];
+    let dispatcher = CliDispatcher::new(
+        &inspectors,
+        &converters,
+        &pacman_adapter,
+        &pacman_adapter,
+        &clock,
+    );
+
+    let mut live_stdout = Vec::new();
+    let mut live_stderr = Vec::new();
+    let live_args = CliArgs::try_parse_from([
+        "install-in-arch",
+        "--ignore-deps",
+        &rpm_path.to_string_lossy(),
+    ])?;
+    let live_res = dispatcher.dispatch(live_args, &mut live_stdout, &mut live_stderr);
+    assert!(matches!(
+        live_res,
+        Err(DomainError::ExecutableNotFound { .. })
+    ));
+
+    let mut deps_stdout = Vec::new();
+    let mut deps_stderr = Vec::new();
+    let deps_args =
+        CliArgs::try_parse_from(["install-in-arch", "--dry-run", &rpm_path.to_string_lossy()])?;
+    let deps_res = dispatcher.dispatch(deps_args, &mut deps_stdout, &mut deps_stderr);
+    assert!(matches!(
+        deps_res,
+        Err(DomainError::ExecutableNotFound { .. })
+    ));
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let dry_args = CliArgs::try_parse_from([
+        "install-in-arch",
+        "--dry-run",
+        "--ignore-deps",
+        "--keep-pkg",
+        &out_dir.to_string_lossy(),
+        &rpm_path.to_string_lossy(),
+    ])?;
+    dispatcher.dispatch(dry_args, &mut stdout, &mut stderr)?;
+
+    let stderr_text = String::from_utf8(stderr)?;
+    let stdout_text = String::from_utf8(stdout)?;
+    assert!(stderr_text.contains("Warning: pacman executable not found"));
+    assert!(stderr_text.contains("protected system package 'glibc'"));
+    assert!(stderr_text.contains("protected system package 'pacman'"));
+    assert!(stderr_text.contains("protected system package 'systemd'"));
+    assert!(stderr_text.contains("protected system package 'bash'"));
+    assert!(stdout_text.contains("[dry-run] Would run:"));
+    assert!(stdout_text.contains("Saved Arch package:"));
+
+    let expected_pkg = out_dir.join("smoke-rpm-1.0.0-1-aarch64.pkg.tar.zst");
+    assert!(expected_pkg.exists());
+
+    let mut pkg_tar = Archive::new(ZstdDecoder::new(File::open(&expected_pkg)?)?);
+    let mut pkginfo_text = String::new();
+    for entry_res in pkg_tar.entries()? {
+        let mut entry = entry_res?;
+        if entry.path()?.to_string_lossy() == ".PKGINFO" {
+            entry.read_to_string(&mut pkginfo_text)?;
+        }
+    }
+    assert!(pkginfo_text.contains("conflict = smoke-rpm-legacy\n"));
+    assert!(pkginfo_text.contains("replaces = smoke-rpm-old\n"));
+    assert!(!pkginfo_text.contains("conflict = glibc"));
+    assert!(!pkginfo_text.contains("conflict = pacman"));
+    assert!(!pkginfo_text.contains("conflict = systemd"));
+    assert!(!pkginfo_text.contains("replaces = bash"));
+
+    Ok(())
+}

@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use crate::domain::dependency_resolver::DependencyResolver;
 use crate::domain::error::DomainError;
 use crate::domain::models::{
-    ArchArchitecture, InstallOptions, PackageName, PackageVersion, PkgInfoMetadata,
-    ResolvedDependencies, SourcePackageFormat,
+    ArchArchitecture, InstallOptions, InstalledPackageSummary, PackageName, PackageVersion,
+    PkgInfoMetadata, ResolvedDependencies, SourcePackageFormat,
 };
 use crate::domain::ports::{
     ArchPackageConverterPort, ArchPackageRepository, ClockPort, PackageConversionRequest,
@@ -103,7 +103,13 @@ impl<'a> InstallPackageUseCase<'a> {
         let arch = ArchArchitecture::from_source_arch(&format, &control.architecture)?;
 
         let mut warnings = Vec::new();
-        self.guard_foreign_package_collision(
+        let mut host_probe = HostPackageProbe::new(
+            self.package_manager,
+            self.arch_repo,
+            command.options.dry_run,
+        );
+        Self::guard_foreign_package_collision(
+            &mut host_probe,
             &pkg_name,
             command.options.allow_replace_foreign,
             &mut warnings,
@@ -149,14 +155,16 @@ impl<'a> InstallPackageUseCase<'a> {
             .clone()
             .unwrap_or_else(|| "custom".to_string());
 
-        let conflicts = self.filter_relation_targets(
+        let conflicts = Self::filter_relation_targets(
+            &mut host_probe,
             &pkg_name,
             control.conflicts,
             "conflict",
             command.options.allow_replace_foreign,
             &mut warnings,
         )?;
-        let replaces = self.filter_relation_targets(
+        let replaces = Self::filter_relation_targets(
+            &mut host_probe,
             &pkg_name,
             control.obsoletes,
             "replaces",
@@ -217,12 +225,12 @@ impl<'a> InstallPackageUseCase<'a> {
     }
 
     fn guard_foreign_package_collision(
-        &self,
+        host_probe: &mut HostPackageProbe<'_>,
         pkg_name: &PackageName,
         allow_replace_foreign: bool,
         warnings: &mut Vec<String>,
     ) -> Result<(), DomainError> {
-        if let Some(installed) = self.package_manager.installed_package_info(pkg_name)? {
+        if let Some(installed) = host_probe.installed_package_info(pkg_name, warnings)? {
             if installed.packager != PkgInfoMetadata::DEFAULT_PACKAGER {
                 if !allow_replace_foreign {
                     return Err(DomainError::ForeignPackageConflict {
@@ -239,7 +247,7 @@ impl<'a> InstallPackageUseCase<'a> {
             return Ok(());
         }
 
-        if self.arch_repo.is_native_sync_package(pkg_name.as_str())? {
+        if host_probe.is_native_sync_package(pkg_name.as_str(), warnings)? {
             if !allow_replace_foreign {
                 return Err(DomainError::ForeignPackageConflict {
                     package: pkg_name.to_string(),
@@ -256,7 +264,7 @@ impl<'a> InstallPackageUseCase<'a> {
     }
 
     fn filter_relation_targets(
-        &self,
+        host_probe: &mut HostPackageProbe<'_>,
         self_pkg_name: &PackageName,
         raw_targets: Vec<String>,
         relation_label: &str,
@@ -278,11 +286,10 @@ impl<'a> InstallPackageUseCase<'a> {
             let Ok(rel_pkg) = PackageName::parse_and_sanitize(&name) else {
                 continue;
             };
-            let is_installed_foreign = self
-                .package_manager
-                .installed_package_info(&rel_pkg)?
+            let is_installed_foreign = host_probe
+                .installed_package_info(&rel_pkg, warnings)?
                 .is_some_and(|info| info.packager != PkgInfoMetadata::DEFAULT_PACKAGER);
-            let is_sync_native = self.arch_repo.is_native_sync_package(rel_pkg.as_str())?;
+            let is_sync_native = host_probe.is_native_sync_package(rel_pkg.as_str(), warnings)?;
 
             if is_installed_foreign || is_sync_native {
                 if !allow_replace_foreign {
@@ -301,5 +308,73 @@ impl<'a> InstallPackageUseCase<'a> {
             filtered.push(name);
         }
         Ok(filtered)
+    }
+}
+
+struct HostPackageProbe<'a> {
+    package_manager: &'a dyn SystemPackageManagerPort,
+    arch_repo: &'a dyn ArchPackageRepository,
+    dry_run: bool,
+    pacman_missing_warned: bool,
+}
+
+impl<'a> HostPackageProbe<'a> {
+    fn new(
+        package_manager: &'a dyn SystemPackageManagerPort,
+        arch_repo: &'a dyn ArchPackageRepository,
+        dry_run: bool,
+    ) -> Self {
+        Self {
+            package_manager,
+            arch_repo,
+            dry_run,
+            pacman_missing_warned: false,
+        }
+    }
+
+    fn installed_package_info(
+        &mut self,
+        pkg_name: &PackageName,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<InstalledPackageSummary>, DomainError> {
+        if self.pacman_missing_warned {
+            return Ok(None);
+        }
+        match self.package_manager.installed_package_info(pkg_name) {
+            Ok(info) => Ok(info),
+            Err(DomainError::ExecutableNotFound { .. }) if self.dry_run => {
+                self.warn_pacman_missing(warnings);
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn is_native_sync_package(
+        &mut self,
+        package_name: &str,
+        warnings: &mut Vec<String>,
+    ) -> Result<bool, DomainError> {
+        if self.pacman_missing_warned {
+            return Ok(false);
+        }
+        match self.arch_repo.is_native_sync_package(package_name) {
+            Ok(exists) => Ok(exists),
+            Err(DomainError::ExecutableNotFound { .. }) if self.dry_run => {
+                self.warn_pacman_missing(warnings);
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn warn_pacman_missing(&mut self, warnings: &mut Vec<String>) {
+        if !self.pacman_missing_warned {
+            self.pacman_missing_warned = true;
+            warnings.push(
+                "pacman executable not found; skipping host foreign/native package collision checks in --dry-run mode."
+                    .to_string(),
+            );
+        }
     }
 }

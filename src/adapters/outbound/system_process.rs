@@ -148,12 +148,17 @@ impl CommandRunnerPort for SystemCommandRunner {
 
 fn map_spawn_error(program: &str, args: &[&str], err: &std::io::Error) -> DomainError {
     let command = sanitize_for_error(&format!("{program} {}", args.join(" ")));
-    let reason = if err.kind() == ErrorKind::NotFound {
-        format!("executable '{}' not found", sanitize_for_error(program))
+    if err.kind() == ErrorKind::NotFound {
+        DomainError::ExecutableNotFound {
+            command,
+            executable: sanitize_for_error(program),
+        }
     } else {
-        sanitize_for_error(&err.to_string())
-    };
-    DomainError::CommandExecutionFailed { command, reason }
+        DomainError::CommandExecutionFailed {
+            command,
+            reason: sanitize_for_error(&err.to_string()),
+        }
+    }
 }
 
 pub struct SystemClock;
@@ -176,11 +181,24 @@ mod tests {
     use crate::domain::ports::TempStorageGuard;
 
     #[test]
-    fn rejects_relative_executable_paths_without_spawning() {
+    fn rejects_relative_and_missing_executable_paths_without_spawning() {
         let runner = SystemCommandRunner;
         let err = runner.run_capture("pacman", &["-V"], &[]);
         assert!(matches!(
             err,
+            Err(DomainError::CommandExecutionFailed { .. })
+        ));
+
+        let missing_err =
+            runner.run_capture("/nonexistent/install-in-arch-missing-pacman", &["-Qq"], &[]);
+        assert!(matches!(
+            missing_err,
+            Err(DomainError::ExecutableNotFound { .. })
+        ));
+
+        let dir_err = runner.run_capture("/tmp", &["-V"], &[]);
+        assert!(matches!(
+            dir_err,
             Err(DomainError::CommandExecutionFailed { .. })
         ));
 

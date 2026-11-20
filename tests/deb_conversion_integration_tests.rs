@@ -19,7 +19,13 @@ use tempfile::TempDir;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
+use clap::Parser;
+use install_in_arch::adapters::inbound::cli::{CliArgs, CliDispatcher};
 use install_in_arch::adapters::outbound::deb_package_adapter::DebPackageAdapter;
+use install_in_arch::adapters::outbound::pacman_adapter::PacmanAdapter;
+use install_in_arch::adapters::outbound::system_process::{
+    CommandOutput, CommandRunnerPort, PrivilegeDetectorPort,
+};
 use install_in_arch::application::install_package::{InstallPackageCommand, InstallPackageUseCase};
 use install_in_arch::application::uninstall_package::{
     UninstallPackageCommand, UninstallPackageUseCase,
@@ -436,15 +442,17 @@ fn converts_deb_with_usr_merge_permissions_links_spaces_and_validates_with_pacma
     let keep_dir = dir.path().join("out");
     let deb_path = dir.path().join("EpicGamesLauncher-x86_64.deb");
 
-    let control_text = "\
-Package: EpicGamesLauncher
-Version: 1:2.3.4-2
-Architecture: amd64
-Homepage: https://store.epicgames.com
-Depends: libwebkit2gtk-4.1-0 (>= 2.40), libgtk-3-0:amd64, libayatana-appindicator3-1, libasound2t64, unknown-extra
-Description: Epic Games Launcher Wrapper
- Long description continues here.
-";
+    let control_text = [
+        "Package: EpicGamesLauncher",
+        "Version: 1:2.3.4-2",
+        "Architecture: amd64",
+        "Homepage: https://store.epicgames.com",
+        "Depends: libwebkit2gtk-4.1-0 (>= 2.40), libgtk-3-0:amd64, libayatana-appindicator3-1, libasound2t64, unknown-extra",
+        "Description: Epic Games Launcher Wrapper",
+        " Long description continues here.",
+        "",
+    ]
+    .join("\n");
 
     let control_entries = [
         SyntheticDebEntry {
@@ -1210,16 +1218,18 @@ fn resolves_usr_merge_collisions_chained_hardlinks_symlinks_and_skips_fifo_orpha
     let out_dir = dir.path().join("out");
     let deb_path = dir.path().join("adversarial_collision.deb");
 
-    let control_text = "\
-Package: collision-test
-Version: 1.0.0
-Architecture: amd64
-Homepage: https://example.org
- depend = injected
-License: MIT
- packager = attacker
-Description: Collision Test
-";
+    let control_text = [
+        "Package: collision-test",
+        "Version: 1.0.0",
+        "Architecture: amd64",
+        "Homepage: https://example.org",
+        " depend = injected",
+        "License: MIT",
+        " packager = attacker",
+        "Description: Collision Test",
+        "",
+    ]
+    .join("\n");
     let control_entries = [SyntheticDebEntry {
         path: "./control".to_string(),
         entry_type: EntryType::Regular,
@@ -2038,6 +2048,152 @@ fn rejects_oversized_xz_dictionary_beyond_memlimit() -> Result<(), Box<dyn std::
         }
         other => return Err(format!("expected InvalidDebArchive, got {other:?}").into()),
     }
+
+    Ok(())
+}
+
+struct MissingPacmanRunner;
+
+impl CommandRunnerPort for MissingPacmanRunner {
+    fn run_capture(
+        &self,
+        program: &str,
+        args: &[&str],
+        _env: &[(&str, &str)],
+    ) -> Result<CommandOutput, DomainError> {
+        Err(DomainError::ExecutableNotFound {
+            command: format!("{program} {}", args.join(" ")),
+            executable: program.to_string(),
+        })
+    }
+
+    fn run_interactive(
+        &self,
+        program: &str,
+        args: &[&str],
+        _env: &[(&str, &str)],
+    ) -> Result<i32, DomainError> {
+        Err(DomainError::ExecutableNotFound {
+            command: format!("{program} {}", args.join(" ")),
+            executable: program.to_string(),
+        })
+    }
+}
+
+struct NonRootPrivileges;
+
+impl PrivilegeDetectorPort for NonRootPrivileges {
+    fn is_root(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn cli_dry_run_ignore_deps_succeeds_without_pacman_and_generates_arch_package()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let out_dir = dir.path().join("smoke_out");
+    let deb_path = dir.path().join("smoke_arm.deb");
+
+    let control_text = [
+        "Package: smoke-arm",
+        "Version: 1.0.0-1",
+        "Architecture: arm64",
+        "Depends: libc6 (>= 2.34)",
+        "Conflicts: bash, smoke-legacy",
+        "Replaces: smoke-old",
+        "Description: Smoke test package for non-Arch host conversion",
+        "",
+    ]
+    .join("\n");
+
+    let control_entries = [SyntheticDebEntry {
+        path: "./control".to_string(),
+        entry_type: EntryType::Regular,
+        mode: 0o644,
+        mtime: 1_700_000_000,
+        data: control_text.as_bytes().to_vec(),
+        link_target: None,
+    }];
+    let data_entries = [SyntheticDebEntry {
+        path: "./usr/bin/smoke-arm".to_string(),
+        entry_type: EntryType::Regular,
+        mode: 0o755,
+        mtime: 1_700_000_000,
+        data: b"#!/bin/sh\necho smoke\n".to_vec(),
+        link_target: None,
+    }];
+
+    write_synthetic_deb(
+        &deb_path,
+        Some(b"2.0\n"),
+        TarCompression::Gzip,
+        Some(&control_entries),
+        TarCompression::Gzip,
+        Some(&data_entries),
+    )?;
+
+    let deb_adapter = DebPackageAdapter::new();
+    let missing_runner = MissingPacmanRunner;
+    let non_root = NonRootPrivileges;
+    let pacman_adapter = PacmanAdapter::new(&missing_runner, &non_root);
+    let clock = FixedClock(1_700_000_000);
+
+    let inspectors: [&dyn SourcePackageInspectorPort; 1] = [&deb_adapter];
+    let converters: [&dyn ArchPackageConverterPort; 1] = [&deb_adapter];
+    let dispatcher = CliDispatcher::new(
+        &inspectors,
+        &converters,
+        &pacman_adapter,
+        &pacman_adapter,
+        &clock,
+    );
+
+    let mut live_stdout = Vec::new();
+    let mut live_stderr = Vec::new();
+    let live_args = CliArgs::try_parse_from([
+        "install-in-arch",
+        "--ignore-deps",
+        &deb_path.to_string_lossy(),
+    ])?;
+    let live_res = dispatcher.dispatch(live_args, &mut live_stdout, &mut live_stderr);
+    assert!(matches!(
+        live_res,
+        Err(DomainError::ExecutableNotFound { .. })
+    ));
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let dry_args = CliArgs::try_parse_from([
+        "install-in-arch",
+        "--dry-run",
+        "--ignore-deps",
+        "--keep-pkg",
+        &out_dir.to_string_lossy(),
+        &deb_path.to_string_lossy(),
+    ])?;
+    dispatcher.dispatch(dry_args, &mut stdout, &mut stderr)?;
+
+    let stderr_text = String::from_utf8(stderr)?;
+    let stdout_text = String::from_utf8(stdout)?;
+    assert!(stderr_text.contains("Warning: pacman executable not found"));
+    assert!(stdout_text.contains("[dry-run] Would run:"));
+    assert!(stdout_text.contains("Saved Arch package:"));
+
+    let expected_pkg = out_dir.join("smoke-arm-1.0.0-1-aarch64.pkg.tar.zst");
+    assert!(expected_pkg.exists());
+
+    let pkg_file = File::open(&expected_pkg)?;
+    let zstd_dec = ZstdDecoder::new(pkg_file)?;
+    let mut pkg_tar = Archive::new(zstd_dec);
+    let mut entry_paths = Vec::new();
+    for entry_res in pkg_tar.entries()? {
+        let entry = entry_res?;
+        entry_paths.push(entry.path()?.to_string_lossy().into_owned());
+    }
+    assert!(entry_paths.contains(&".PKGINFO".to_string()));
+    assert!(entry_paths.contains(&".MTREE".to_string()));
+    assert!(entry_paths.contains(&"usr/bin/smoke-arm".to_string()));
 
     Ok(())
 }

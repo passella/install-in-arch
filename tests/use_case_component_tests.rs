@@ -909,3 +909,333 @@ fn list_use_case_and_cli_dispatcher_sanitize_outputs_and_parse_security_flags() 
         assert!(!args.allow_suid);
     }
 }
+
+struct ConfigurablePacmanDouble {
+    installed_result: Result<Option<InstalledPackageSummary>, DomainError>,
+    sync_result: Result<bool, DomainError>,
+    exists_result: Result<bool, DomainError>,
+}
+
+impl ArchPackageRepository for ConfigurablePacmanDouble {
+    fn package_exists(&self, _package_name: &str) -> Result<bool, DomainError> {
+        self.exists_result.clone()
+    }
+
+    fn is_native_sync_package(&self, _package_name: &str) -> Result<bool, DomainError> {
+        self.sync_result.clone()
+    }
+}
+
+impl SystemPackageManagerPort for ConfigurablePacmanDouble {
+    fn is_installed(&self, package_name: &PackageName) -> Result<bool, DomainError> {
+        Ok(self.installed_package_info(package_name)?.is_some())
+    }
+
+    fn installed_package_info(
+        &self,
+        _package_name: &PackageName,
+    ) -> Result<Option<InstalledPackageSummary>, DomainError> {
+        self.installed_result.clone()
+    }
+
+    fn install_local_package(
+        &self,
+        _package_archive: &Path,
+        _auto_confirm: bool,
+    ) -> Result<(), DomainError> {
+        Ok(())
+    }
+
+    fn uninstall_package(
+        &self,
+        _package_name: &PackageName,
+        _keep_deps: bool,
+        _auto_confirm: bool,
+    ) -> Result<(), DomainError> {
+        Ok(())
+    }
+
+    fn list_managed_packages(
+        &self,
+        _packager_marker: &str,
+    ) -> Result<Vec<InstalledPackageSummary>, DomainError> {
+        Ok(Vec::new())
+    }
+
+    fn install_command_preview(&self, package_archive: &Path, _auto_confirm: bool) -> String {
+        format!(
+            "/usr/bin/sudo /usr/bin/pacman -U -- {}",
+            package_archive.display()
+        )
+    }
+
+    fn uninstall_command_preview(
+        &self,
+        package_name: &PackageName,
+        _keep_deps: bool,
+        _auto_confirm: bool,
+    ) -> String {
+        format!("/usr/bin/sudo /usr/bin/pacman -Rs -- {package_name}")
+    }
+}
+
+fn missing_pacman_error(args: &str) -> DomainError {
+    DomainError::ExecutableNotFound {
+        command: format!("/usr/bin/pacman {args}"),
+        executable: "/usr/bin/pacman".to_string(),
+    }
+}
+
+#[test]
+fn dry_run_missing_pacman_preserves_live_failures_command_errors_and_collision_guards() {
+    let mut meta_with_relations = sample_control_metadata();
+    meta_with_relations.maintainer_scripts.clear();
+    meta_with_relations.conflicts = vec!["bash".to_string(), "legacy-conflict".to_string()];
+    meta_with_relations.obsoletes = vec!["epic-app".to_string(), "old-launcher".to_string()];
+
+    let inspector = MockPackageInspector {
+        format: SourcePackageFormat::Deb,
+        metadata: Ok(meta_with_relations.clone()),
+    };
+    let converter = MockConverter::new();
+    let clock = StubClock(1_700_000_000);
+    let inspectors: [&dyn SourcePackageInspectorPort; 1] = [&inspector];
+    let converters: [&dyn ArchPackageConverterPort; 1] = [&converter];
+
+    let missing_pacman = ConfigurablePacmanDouble {
+        installed_result: Err(missing_pacman_error("-Qq")),
+        sync_result: Err(missing_pacman_error("-Slq")),
+        exists_result: Err(missing_pacman_error("-Qq")),
+    };
+    let uc_missing = InstallPackageUseCase::new(
+        &inspectors,
+        &converters,
+        &missing_pacman,
+        &missing_pacman,
+        &clock,
+    );
+
+    let live_err = uc_missing.execute(InstallPackageCommand {
+        source_path: PathBuf::from("epic.deb"),
+        options: InstallOptions {
+            ignore_deps: true,
+            dry_run: false,
+            ..InstallOptions::default()
+        },
+    });
+    assert!(matches!(
+        live_err,
+        Err(DomainError::ExecutableNotFound { .. })
+    ));
+
+    let dry_with_deps_err = uc_missing.execute(InstallPackageCommand {
+        source_path: PathBuf::from("epic.deb"),
+        options: InstallOptions {
+            ignore_deps: false,
+            dry_run: true,
+            ..InstallOptions::default()
+        },
+    });
+    assert!(matches!(
+        dry_with_deps_err,
+        Err(DomainError::ExecutableNotFound { .. })
+    ));
+
+    let failed_installed_query = ConfigurablePacmanDouble {
+        installed_result: Err(DomainError::CommandExecutionFailed {
+            command: "/usr/bin/pacman -Qq".to_string(),
+            reason: "permission denied".to_string(),
+        }),
+        sync_result: Ok(false),
+        exists_result: Ok(false),
+    };
+    let uc_query_fail = InstallPackageUseCase::new(
+        &inspectors,
+        &converters,
+        &failed_installed_query,
+        &failed_installed_query,
+        &clock,
+    );
+    assert!(matches!(
+        uc_query_fail.execute(InstallPackageCommand {
+            source_path: PathBuf::from("epic.deb"),
+            options: InstallOptions {
+                ignore_deps: true,
+                dry_run: true,
+                ..InstallOptions::default()
+            },
+        }),
+        Err(DomainError::CommandExecutionFailed { .. })
+    ));
+
+    let failed_sync_query = ConfigurablePacmanDouble {
+        installed_result: Ok(None),
+        sync_result: Err(DomainError::CommandExecutionFailed {
+            command: "/usr/bin/pacman -Slq".to_string(),
+            reason: "sync db corrupt".to_string(),
+        }),
+        exists_result: Ok(false),
+    };
+    let uc_sync_fail = InstallPackageUseCase::new(
+        &inspectors,
+        &converters,
+        &failed_sync_query,
+        &failed_sync_query,
+        &clock,
+    );
+    assert!(matches!(
+        uc_sync_fail.execute(InstallPackageCommand {
+            source_path: PathBuf::from("epic.deb"),
+            options: InstallOptions {
+                ignore_deps: true,
+                dry_run: true,
+                ..InstallOptions::default()
+            },
+        }),
+        Err(DomainError::CommandExecutionFailed { .. })
+    ));
+
+    let mut foreign_pm = MockSystemPackageManager::new();
+    foreign_pm.insert_foreign("epic-app", "Arch Linux <arch@archlinux.org>");
+    let repo_ok = MockArchRepo::from_names(&[]);
+    let uc_foreign =
+        InstallPackageUseCase::new(&inspectors, &converters, &repo_ok, &foreign_pm, &clock);
+    let dry_collision_err = uc_foreign.execute(InstallPackageCommand {
+        source_path: PathBuf::from("epic.deb"),
+        options: InstallOptions {
+            ignore_deps: true,
+            dry_run: true,
+            ..InstallOptions::default()
+        },
+    });
+    assert!(matches!(
+        dry_collision_err,
+        Err(DomainError::ForeignPackageConflict { .. })
+    ));
+
+    let dry_ignore_ok = uc_missing.execute(InstallPackageCommand {
+        source_path: PathBuf::from("epic.deb"),
+        options: InstallOptions {
+            ignore_deps: true,
+            dry_run: true,
+            keep_pkg_dir: Some(PathBuf::from("/tmp/kept-offline")),
+            ..InstallOptions::default()
+        },
+    });
+    assert!(dry_ignore_ok.is_ok());
+    if let Ok(out) = dry_ignore_ok {
+        assert!(out.dry_run);
+        assert_eq!(out.metadata.conflicts, vec!["legacy-conflict"]);
+        assert_eq!(out.metadata.replaces, vec!["old-launcher"]);
+        let pacman_warnings = out
+            .warnings
+            .iter()
+            .filter(|w| w.contains("pacman executable not found"))
+            .count();
+        assert_eq!(pacman_warnings, 1);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("protected system package 'bash'"))
+        );
+    }
+
+    let mut no_deps_meta = meta_with_relations;
+    no_deps_meta.depends.clear();
+    no_deps_meta.pre_depends.clear();
+    let no_deps_inspector = MockPackageInspector {
+        format: SourcePackageFormat::Deb,
+        metadata: Ok(no_deps_meta),
+    };
+    let no_deps_inspectors: [&dyn SourcePackageInspectorPort; 1] = [&no_deps_inspector];
+    let uc_no_deps = InstallPackageUseCase::new(
+        &no_deps_inspectors,
+        &converters,
+        &missing_pacman,
+        &missing_pacman,
+        &clock,
+    );
+    let dry_offline_no_deps = uc_no_deps.execute(InstallPackageCommand {
+        source_path: PathBuf::from("epic-nodeps.deb"),
+        options: InstallOptions {
+            ignore_deps: false,
+            dry_run: true,
+            ..InstallOptions::default()
+        },
+    });
+    assert!(dry_offline_no_deps.is_ok());
+
+    let mut rpm_meta_missing = sample_rpm_metadata();
+    rpm_meta_missing.maintainer_scripts.clear();
+    rpm_meta_missing.conflicts = vec![
+        "glibc".to_string(),
+        "pacman".to_string(),
+        "systemd".to_string(),
+        "fedora-tool".to_string(),
+        "custom-rpm-conflict".to_string(),
+    ];
+    rpm_meta_missing.obsoletes = vec![
+        "bash".to_string(),
+        "pacman".to_string(),
+        "fedora-tool".to_string(),
+        "custom-rpm-obsolete".to_string(),
+    ];
+    let rpm_inspector = MockPackageInspector {
+        format: SourcePackageFormat::Rpm,
+        metadata: Ok(rpm_meta_missing),
+    };
+    let rpm_converter = MockConverter::with_rpm();
+    let rpm_inspectors: [&dyn SourcePackageInspectorPort; 1] = [&rpm_inspector];
+    let rpm_converters: [&dyn ArchPackageConverterPort; 1] = [&rpm_converter];
+    let uc_rpm_missing = InstallPackageUseCase::new(
+        &rpm_inspectors,
+        &rpm_converters,
+        &missing_pacman,
+        &missing_pacman,
+        &clock,
+    );
+
+    let rpm_dry_with_deps_err = uc_rpm_missing.execute(InstallPackageCommand {
+        source_path: PathBuf::from("fedora-tool.rpm"),
+        options: InstallOptions {
+            ignore_deps: false,
+            dry_run: true,
+            ..InstallOptions::default()
+        },
+    });
+    assert!(matches!(
+        rpm_dry_with_deps_err,
+        Err(DomainError::ExecutableNotFound { .. })
+    ));
+
+    let rpm_dry_ignore_ok = uc_rpm_missing.execute(InstallPackageCommand {
+        source_path: PathBuf::from("fedora-tool.rpm"),
+        options: InstallOptions {
+            ignore_deps: true,
+            dry_run: true,
+            keep_pkg_dir: Some(PathBuf::from("/tmp/kept-rpm-offline")),
+            ..InstallOptions::default()
+        },
+    });
+    assert!(rpm_dry_ignore_ok.is_ok());
+    if let Ok(out) = rpm_dry_ignore_ok {
+        assert!(out.dry_run);
+        assert_eq!(out.metadata.pkgname.as_str(), "fedora-tool");
+        assert_eq!(out.metadata.conflicts, vec!["custom-rpm-conflict"]);
+        assert_eq!(out.metadata.replaces, vec!["custom-rpm-obsolete"]);
+        let pacman_warnings = out
+            .warnings
+            .iter()
+            .filter(|w| w.contains("pacman executable not found"))
+            .count();
+        assert_eq!(pacman_warnings, 1);
+        for protected in ["glibc", "pacman", "systemd", "bash"] {
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|w| w.contains(&format!("protected system package '{protected}'"))),
+                "expected protected warning for {protected}"
+            );
+        }
+    }
+}

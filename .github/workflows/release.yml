@@ -2,6 +2,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - master
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+*'
   workflow_dispatch: {}
@@ -70,12 +72,10 @@ jobs:
           ref_type = os.environ.get("REF_TYPE", "")
 
           if event_name == "push":
-              if ref_type != "tag":
-                  print(f"Error: push release requires a tag ref (got ref_type='{ref_type}', ref='{ref_name}').", file=sys.stderr)
-                  sys.exit(1)
-              if ref_name != expected_tag:
-                  print(f"Error: tag '{ref_name}' does not match Cargo.toml version '{expected_tag}'.", file=sys.stderr)
-                  sys.exit(1)
+              if ref_type == "tag":
+                  if ref_name != expected_tag:
+                      print(f"Error: tag '{ref_name}' does not match Cargo.toml version '{expected_tag}'.", file=sys.stderr)
+                      sys.exit(1)
           elif event_name == "workflow_dispatch":
               if ref_type != "branch" or ref_name != "master":
                   print(
@@ -499,4 +499,7 @@ jobs:
             RELEASE_ARGS+=(--prerelease)
           fi
 
-          gh release create "${RELEASE_ARGS[@]}"
+          if gh release view "${TAG}" &>/dev/null; then
+            gh release delete "${TAG}" --yes --cleanup-tag || true
+          fi
+          gh release create "${RELEASE_ARGS[@]}" 

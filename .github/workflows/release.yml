@@ -121,9 +121,10 @@ jobs:
           esac
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
-        with:
-          components: rustfmt, clippy
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
 
       - name: Check formatting
         run: cargo fmt --check
@@ -169,9 +170,12 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
-        with:
-          targets: ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --target "${TARGET}"
+          rustup default stable
 
       - name: Build static musl release binary and package assets
         env:
@@ -356,10 +360,10 @@ jobs:
     runs-on: ubuntu-24.04
     environment: release
     permissions:
-      contents: write
-      pull-requests: read
-      id-token: write
-      attestations: write
+      contents: write # create/update the GitHub Release and upload assets
+      pull-requests: read # read PR metadata for release notes
+      id-token: write # OIDC token for build provenance attestation
+      attestations: write # persist build provenance attestations
 
     steps:
       - name: Checkout repository

@@ -330,3 +330,23 @@ impl<'a> CliDispatcher<'a> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CliArgs;
+    use clap::Parser;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn version_flags_render_cargo_pkg_version() {
+        let expected = format!("install-in-arch {}\n", env!("CARGO_PKG_VERSION"));
+        for flag in ["--version", "-V"] {
+            let result = CliArgs::try_parse_from(["install-in-arch", flag]);
+            assert!(result.is_err());
+            if let Err(err) = result {
+                assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+                assert_eq!(err.to_string(), expected);
+            }
+        }
+    }
+}

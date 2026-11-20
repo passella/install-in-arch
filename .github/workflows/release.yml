@@ -2,9 +2,9 @@ name: Release
 
 on:
   push:
-    branches:
-      - master
-  workflow_dispatch:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -17,36 +17,110 @@ jobs:
   check:
     name: Format, Clippy & Tests
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      checks: write
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
 
     steps:
-      - name: Enforce master branch for release
-        env:
-          RELEASE_REF: ${{ github.ref }}
-        run: |
-          set -euo pipefail
-          if [ "${RELEASE_REF}" != "refs/heads/master" ]; then
-            echo "Error: release workflow may only run on refs/heads/master (got '${RELEASE_REF}')." >&2
-            exit 1
-          fi
-
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Generate release tag
+      - name: Validate Cargo version and resolve release tag
         id: meta
-        run: echo "tag=$(date -u +'%Y%m%d%H%M%S')" >> "${GITHUB_OUTPUT}"
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+          import tomllib
+
+          SEMVER_RE = re.compile(
+              r"\A(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+              r"(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?"
+              r"(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?\Z",
+              re.ASCII,
+          )
+
+          with open("Cargo.toml", "rb") as fh:
+              cargo = tomllib.load(fh)
+
+          version = cargo.get("package", {}).get("version")
+          match = SEMVER_RE.fullmatch(version) if isinstance(version, str) else None
+          if match is None:
+              print(f"Error: Cargo.toml package.version '{version}' is not valid SemVer 2.0.0.", file=sys.stderr)
+              sys.exit(1)
+
+          expected_tag = f"v{version}"
+          if "\r" in expected_tag or "\n" in expected_tag:
+              print("Error: resolved release tag contains invalid newline characters.", file=sys.stderr)
+              sys.exit(1)
+
+          is_prerelease = "true" if match.group(4) is not None else "false"
+
+          event_name = os.environ.get("EVENT_NAME", "")
+          ref_name = os.environ.get("REF_NAME", "")
+          ref_type = os.environ.get("REF_TYPE", "")
+
+          if event_name == "push":
+              if ref_type != "tag":
+                  print(f"Error: push release requires a tag ref (got ref_type='{ref_type}', ref='{ref_name}').", file=sys.stderr)
+                  sys.exit(1)
+              if ref_name != expected_tag:
+                  print(f"Error: tag '{ref_name}' does not match Cargo.toml version '{expected_tag}'.", file=sys.stderr)
+                  sys.exit(1)
+          elif event_name == "workflow_dispatch":
+              if ref_type != "branch" or ref_name != "master":
+                  print(
+                      f"Error: workflow_dispatch release requires refs/heads/master (got ref_type='{ref_type}', ref='{ref_name}').",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+          else:
+              print(f"Error: unsupported event '{event_name}' for release workflow.", file=sys.stderr)
+              sys.exit(1)
+
+          github_output = os.environ["GITHUB_OUTPUT"]
+          with open(github_output, "a", encoding="utf-8") as fh:
+              fh.write(f"tag={expected_tag}\n")
+              fh.write(f"is_prerelease={is_prerelease}\n")
+
+          print(f"Resolved release tag: {expected_tag} (prerelease={is_prerelease}, event={event_name})")
+          PY
+
+      - name: Verify tagged commit is an ancestor of master
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          STATUS="$(gh api "repos/${GITHUB_REPOSITORY}/compare/heads/master...${GITHUB_SHA}" --jq '.status')"
+          case "${STATUS}" in
+            identical|behind)
+              echo "Verified ${GITHUB_SHA} ancestry on master (compare status=${STATUS})."
+              ;;
+            *)
+              echo "Error: tagged commit ${GITHUB_SHA} is not an ancestor of master (compare status=${STATUS})." >&2
+              exit 1
+              ;;
+          esac
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: rustfmt, clippy
-
-      - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Check formatting
         run: cargo fmt --check
@@ -88,6 +162,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Install musl toolchain
@@ -99,11 +174,6 @@ jobs:
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          key: ${{ matrix.target }}
 
       - name: Build static musl release binary and package assets
         env:
@@ -284,8 +354,9 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [check, build, smoke-archlinux, smoke-aarch64]
-    if: github.ref == 'refs/heads/master'
+    if: (github.event_name == 'push' && github.ref_type == 'tag') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master')
     runs-on: ubuntu-24.04
+    environment: release
     permissions:
       contents: write
       pull-requests: read
@@ -296,6 +367,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Download all release artifacts
@@ -376,9 +448,63 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.check.outputs.tag }}
+          IS_PRERELEASE: ${{ needs.check.outputs.is_prerelease }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          gh release create "${TAG}" dist/* \
-            --title "${TAG}" \
-            --notes-file /tmp/release_notes.md \
+          ENCODED_TAG="$(jq -rn --arg v "${TAG}" '$v|@uri')"
+          TAG_SHA=""
+          if REF_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${ENCODED_TAG}" 2>&1)"; then
+            OBJ_TYPE="$(printf '%s' "${REF_JSON}" | jq -r --arg r "refs/tags/${TAG}" 'if type == "array" then ([.[] | select(.ref == $r)][0].object.type // "") elif .ref == $r then (.object.type // "") else "" end')"
+            OBJ_SHA="$(printf '%s' "${REF_JSON}" | jq -r --arg r "refs/tags/${TAG}" 'if type == "array" then ([.[] | select(.ref == $r)][0].object.sha // "") elif .ref == $r then (.object.sha // "") else "" end')"
+            if [ -z "${OBJ_TYPE}" ] || [ -z "${OBJ_SHA}" ]; then
+              if [ "${EVENT_NAME}" = "push" ]; then
+                echo "Error: remote tag ref 'refs/tags/${TAG}' was not found." >&2
+                exit 1
+              fi
+            else
+              DEPTH=0
+              while [ "${OBJ_TYPE}" = "tag" ]; do
+                DEPTH=$((DEPTH + 1))
+                if [ "${DEPTH}" -gt 8 ]; then
+                  echo "Error: annotated tag dereference depth exceeded for '${TAG}'." >&2
+                  exit 1
+                fi
+                TAG_OBJ_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${OBJ_SHA}")"
+                OBJ_TYPE="$(printf '%s' "${TAG_OBJ_JSON}" | jq -r '.object.type // ""')"
+                OBJ_SHA="$(printf '%s' "${TAG_OBJ_JSON}" | jq -r '.object.sha // ""')"
+              done
+              if [ "${OBJ_TYPE}" != "commit" ] || [ -z "${OBJ_SHA}" ]; then
+                echo "Error: remote tag '${TAG}' resolved to unsupported object type '${OBJ_TYPE}'." >&2
+                exit 1
+              fi
+              TAG_SHA="${OBJ_SHA}"
+            fi
+          elif [ "${EVENT_NAME}" = "push" ]; then
+            echo "Error: failed to resolve remote ref for tag '${TAG}': ${REF_JSON}" >&2
+            exit 1
+          elif ! printf '%s' "${REF_JSON}" | grep -q 'HTTP 404'; then
+            echo "Error: failed to query remote ref for tag '${TAG}': ${REF_JSON}" >&2
+            exit 1
+          fi
+
+          if [ -n "${TAG_SHA}" ] && [ "${TAG_SHA}" != "${GITHUB_SHA}" ]; then
+            echo "Error: remote tag '${TAG}' points to '${TAG_SHA}', expected '${GITHUB_SHA}'." >&2
+            exit 1
+          fi
+
+          RELEASE_ARGS=(
+            "${TAG}"
+            dist/*
+            --title "${TAG}"
+            --notes-file /tmp/release_notes.md
             --target "${GITHUB_SHA}"
+          )
+          if [ "${EVENT_NAME}" = "push" ]; then
+            RELEASE_ARGS+=(--verify-tag)
+          fi
+          if [ "${IS_PRERELEASE}" = "true" ]; then
+            RELEASE_ARGS+=(--prerelease)
+          fi
+
+          gh release create "${RELEASE_ARGS[@]}"

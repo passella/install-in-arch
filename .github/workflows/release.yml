@@ -76,6 +76,12 @@ jobs:
                   if ref_name != expected_tag:
                       print(f"Error: tag '{ref_name}' does not match Cargo.toml version '{expected_tag}'.", file=sys.stderr)
                       sys.exit(1)
+              elif ref_type != "branch" or ref_name != "master":
+                  print(
+                      f"Error: push release requires refs/heads/master or matching SemVer tag (got ref_type='{ref_type}', ref='{ref_name}').",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
           elif event_name == "workflow_dispatch":
               if ref_type != "branch" or ref_name != "master":
                   print(
@@ -346,7 +352,7 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [check, build, smoke-archlinux, smoke-aarch64]
-    if: (github.event_name == 'push' && github.ref_type == 'tag') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master')
+    if: (github.event_name == 'push' && (github.ref_type == 'tag' || github.ref == 'refs/heads/master')) || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master')
     runs-on: ubuntu-24.04
     environment: release
     permissions:
@@ -442,6 +448,7 @@ jobs:
           TAG: ${{ needs.check.outputs.tag }}
           IS_PRERELEASE: ${{ needs.check.outputs.is_prerelease }}
           EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
           ENCODED_TAG="$(jq -rn --arg v "${TAG}" '$v|@uri')"
@@ -450,7 +457,7 @@ jobs:
             OBJ_TYPE="$(printf '%s' "${REF_JSON}" | jq -r --arg r "refs/tags/${TAG}" 'if type == "array" then ([.[] | select(.ref == $r)][0].object.type // "") elif .ref == $r then (.object.type // "") else "" end')"
             OBJ_SHA="$(printf '%s' "${REF_JSON}" | jq -r --arg r "refs/tags/${TAG}" 'if type == "array" then ([.[] | select(.ref == $r)][0].object.sha // "") elif .ref == $r then (.object.sha // "") else "" end')"
             if [ -z "${OBJ_TYPE}" ] || [ -z "${OBJ_SHA}" ]; then
-              if [ "${EVENT_NAME}" = "push" ]; then
+              if [ "${REF_TYPE}" = "tag" ]; then
                 echo "Error: remote tag ref 'refs/tags/${TAG}' was not found." >&2
                 exit 1
               fi
@@ -472,7 +479,7 @@ jobs:
               fi
               TAG_SHA="${OBJ_SHA}"
             fi
-          elif [ "${EVENT_NAME}" = "push" ]; then
+          elif [ "${REF_TYPE}" = "tag" ]; then
             echo "Error: failed to resolve remote ref for tag '${TAG}': ${REF_JSON}" >&2
             exit 1
           elif ! printf '%s' "${REF_JSON}" | grep -q 'HTTP 404'; then
@@ -480,7 +487,7 @@ jobs:
             exit 1
           fi
 
-          if [ -n "${TAG_SHA}" ] && [ "${TAG_SHA}" != "${GITHUB_SHA}" ]; then
+          if [ "${REF_TYPE}" = "tag" ] && [ "${TAG_SHA}" != "${GITHUB_SHA}" ]; then
             echo "Error: remote tag '${TAG}' points to '${TAG_SHA}', expected '${GITHUB_SHA}'." >&2
             exit 1
           fi
@@ -492,7 +499,7 @@ jobs:
             --notes-file /tmp/release_notes.md
             --target "${GITHUB_SHA}"
           )
-          if [ "${EVENT_NAME}" = "push" ]; then
+          if [ "${REF_TYPE}" = "tag" ]; then
             RELEASE_ARGS+=(--verify-tag)
           fi
           if [ "${IS_PRERELEASE}" = "true" ]; then
@@ -501,5 +508,8 @@ jobs:
 
           if gh release view "${TAG}" &>/dev/null; then
             gh release delete "${TAG}" --yes --cleanup-tag || true
+          fi
+          if [ "${REF_TYPE}" != "tag" ] && [ -n "${TAG_SHA}" ]; then
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${ENCODED_TAG}" &>/dev/null || true
           fi
           gh release create "${RELEASE_ARGS[@]}" 

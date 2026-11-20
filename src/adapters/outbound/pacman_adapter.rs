@@ -4,14 +4,19 @@ use std::sync::Mutex;
 
 use crate::adapters::outbound::system_process::{CommandRunnerPort, PrivilegeDetectorPort};
 use crate::domain::error::DomainError;
-use crate::domain::models::{InstalledPackageSummary, PackageName, PkgInfoMetadata};
+use crate::domain::models::{InstalledPackageSummary, PackageName};
 use crate::domain::ports::{ArchPackageRepository, SystemPackageManagerPort};
+use crate::domain::sanitizer::sanitize_for_error;
+
+pub const PACMAN_BIN: &str = "/usr/bin/pacman";
+pub const SUDO_BIN: &str = "/usr/bin/sudo";
 
 pub struct PacmanAdapter<'a> {
     runner: &'a dyn CommandRunnerPort,
     privileges: &'a dyn PrivilegeDetectorPort,
     installed_exact: Mutex<Option<HashSet<String>>>,
     sync_exact: Mutex<Option<HashSet<String>>>,
+    virtual_provides: Mutex<Option<HashSet<String>>>,
     probe_cache: Mutex<HashMap<String, bool>>,
 }
 
@@ -25,6 +30,7 @@ impl<'a> PacmanAdapter<'a> {
             privileges,
             installed_exact: Mutex::new(None),
             sync_exact: Mutex::new(None),
+            virtual_provides: Mutex::new(None),
             probe_cache: Mutex::new(HashMap::new()),
         }
     }
@@ -41,6 +47,12 @@ impl<'a> PacmanAdapter<'a> {
             reason: "mutex poisoned".to_string(),
         })?;
         *sync = None;
+
+        let mut provides = self.virtual_provides.lock().map_err(|_| DomainError::Io {
+            context: "pacman provides cache lock".to_string(),
+            reason: "mutex poisoned".to_string(),
+        })?;
+        *provides = None;
 
         let mut probe = self.probe_cache.lock().map_err(|_| DomainError::Io {
             context: "pacman probe cache lock".to_string(),
@@ -60,18 +72,20 @@ impl<'a> PacmanAdapter<'a> {
         if guard.is_none() {
             let output = self
                 .runner
-                .run_capture("pacman", &["-Qq"], &[("LC_ALL", "C")])?;
-            let set = if output.success {
-                output
-                    .stdout
-                    .lines()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToString::to_string)
-                    .collect()
-            } else {
-                HashSet::new()
-            };
+                .run_capture(PACMAN_BIN, &["-Qq"], &[("LC_ALL", "C")])?;
+            if !output.success {
+                return Err(DomainError::CommandExecutionFailed {
+                    command: format!("{PACMAN_BIN} -Qq"),
+                    reason: sanitize_for_error(output.stderr.trim()),
+                });
+            }
+            let set = output
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .collect();
             *guard = Some(set);
         }
 
@@ -87,18 +101,57 @@ impl<'a> PacmanAdapter<'a> {
         if guard.is_none() {
             let output = self
                 .runner
-                .run_capture("pacman", &["-Slq"], &[("LC_ALL", "C")])?;
-            let set = if output.success {
-                output
-                    .stdout
-                    .lines()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToString::to_string)
-                    .collect()
-            } else {
-                HashSet::new()
-            };
+                .run_capture(PACMAN_BIN, &["-Slq"], &[("LC_ALL", "C")])?;
+            if !output.success {
+                return Err(DomainError::CommandExecutionFailed {
+                    command: format!("{PACMAN_BIN} -Slq"),
+                    reason: sanitize_for_error(output.stderr.trim()),
+                });
+            }
+            let set = output
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .collect();
+            *guard = Some(set);
+        }
+
+        Ok(guard.as_ref().is_some_and(|set| set.contains(pkg)))
+    }
+
+    fn ensure_virtual_provides_contains(&self, pkg: &str) -> Result<bool, DomainError> {
+        let mut guard = self.virtual_provides.lock().map_err(|_| DomainError::Io {
+            context: "pacman provides cache lock".to_string(),
+            reason: "mutex poisoned".to_string(),
+        })?;
+
+        if guard.is_none() {
+            let mut set = HashSet::new();
+
+            let qi_output = self
+                .runner
+                .run_capture(PACMAN_BIN, &["-Qi"], &[("LC_ALL", "C")])?;
+            if !qi_output.success {
+                return Err(DomainError::CommandExecutionFailed {
+                    command: format!("{PACMAN_BIN} -Qi"),
+                    reason: sanitize_for_error(qi_output.stderr.trim()),
+                });
+            }
+            collect_names_and_provides(&qi_output.stdout, &mut set);
+
+            let si_output = self
+                .runner
+                .run_capture(PACMAN_BIN, &["-Si"], &[("LC_ALL", "C")])?;
+            if !si_output.success {
+                return Err(DomainError::CommandExecutionFailed {
+                    command: format!("{PACMAN_BIN} -Si"),
+                    reason: sanitize_for_error(si_output.stderr.trim()),
+                });
+            }
+            collect_names_and_provides(&si_output.stdout, &mut set);
+
             *guard = Some(set);
         }
 
@@ -131,26 +184,7 @@ impl<'a> PacmanAdapter<'a> {
             return Ok(true);
         }
 
-        let local_virtual =
-            self.runner
-                .run_capture("pacman", &["-Qq", "--", pkg], &[("LC_ALL", "C")])?;
-        if local_virtual.success {
-            return Ok(true);
-        }
-
-        let sync_info =
-            self.runner
-                .run_capture("pacman", &["-Si", "--", pkg], &[("LC_ALL", "C")])?;
-        if sync_info.success {
-            return Ok(true);
-        }
-
-        let sync_virtual = self.runner.run_capture(
-            "pacman",
-            &["-Sddp", "--print-format", "%n", "--", pkg],
-            &[("LC_ALL", "C")],
-        )?;
-        Ok(sync_virtual.success)
+        self.ensure_virtual_provides_contains(pkg)
     }
 
     fn build_install_args<'b>(
@@ -166,16 +200,16 @@ impl<'a> PacmanAdapter<'a> {
             }
             args.push("--");
             args.push(package_archive);
-            ("pacman", args)
+            (PACMAN_BIN, args)
         } else {
-            args.push("pacman");
+            args.push(PACMAN_BIN);
             args.push("-U");
             if auto_confirm {
                 args.push("--noconfirm");
             }
             args.push("--");
             args.push(package_archive);
-            ("sudo", args)
+            (SUDO_BIN, args)
         }
     }
 
@@ -194,16 +228,16 @@ impl<'a> PacmanAdapter<'a> {
             }
             args.push("--");
             args.push(pkg_name);
-            ("pacman", args)
+            (PACMAN_BIN, args)
         } else {
-            args.push("pacman");
+            args.push(PACMAN_BIN);
             args.push(mode_flag);
             if auto_confirm {
                 args.push("--noconfirm");
             }
             args.push("--");
             args.push(pkg_name);
-            ("sudo", args)
+            (SUDO_BIN, args)
         }
     }
 }
@@ -217,16 +251,45 @@ impl ArchPackageRepository for PacmanAdapter<'_> {
         self.store_cached(package_name, exists)?;
         Ok(exists)
     }
+
+    fn is_native_sync_package(&self, package_name: &str) -> Result<bool, DomainError> {
+        if package_name.starts_with('-') {
+            return Ok(false);
+        }
+        self.ensure_sync_set_contains(package_name)
+    }
 }
 
 impl SystemPackageManagerPort for PacmanAdapter<'_> {
     fn is_installed(&self, package_name: &PackageName) -> Result<bool, DomainError> {
+        Ok(self.installed_package_info(package_name)?.is_some())
+    }
+
+    fn installed_package_info(
+        &self,
+        package_name: &PackageName,
+    ) -> Result<Option<InstalledPackageSummary>, DomainError> {
+        if !self.ensure_installed_set_contains(package_name.as_str())? {
+            return Ok(None);
+        }
         let output = self.runner.run_capture(
-            "pacman",
-            &["-Q", "--", package_name.as_str()],
+            PACMAN_BIN,
+            &["-Qi", "--", package_name.as_str()],
             &[("LC_ALL", "C")],
         )?;
-        Ok(output.success)
+        if !output.success {
+            if output.stderr.contains("was not found") || output.stderr.trim() == "not found" {
+                return Ok(None);
+            }
+            return Err(DomainError::CommandExecutionFailed {
+                command: format!("{PACMAN_BIN} -Qi -- {}", package_name.as_str()),
+                reason: sanitize_for_error(output.stderr.trim()),
+            });
+        }
+        let stanzas = parse_all_pacman_qi_stanzas(&output.stdout);
+        Ok(stanzas
+            .into_iter()
+            .find(|pkg| pkg.name == package_name.as_str()))
     }
 
     fn install_local_package(
@@ -234,8 +297,11 @@ impl SystemPackageManagerPort for PacmanAdapter<'_> {
         package_archive: &Path,
         auto_confirm: bool,
     ) -> Result<(), DomainError> {
-        let archive_str = package_archive.to_string_lossy();
-        let (program, args) = self.build_install_args(&archive_str, auto_confirm);
+        let archive_str = package_archive.to_str().ok_or_else(|| DomainError::Io {
+            context: "converting archive path to UTF-8".to_string(),
+            reason: "archive path contains invalid UTF-8".to_string(),
+        })?;
+        let (program, args) = self.build_install_args(archive_str, auto_confirm);
         self.runner.run_interactive(program, &args, &[])?;
         self.invalidate_caches()?;
         Ok(())
@@ -260,11 +326,11 @@ impl SystemPackageManagerPort for PacmanAdapter<'_> {
     ) -> Result<Vec<InstalledPackageSummary>, DomainError> {
         let output = self
             .runner
-            .run_capture("pacman", &["-Qi"], &[("LC_ALL", "C")])?;
+            .run_capture(PACMAN_BIN, &["-Qi"], &[("LC_ALL", "C")])?;
         if !output.success {
             return Err(DomainError::CommandExecutionFailed {
-                command: "pacman -Qi".to_string(),
-                reason: output.stderr.trim().to_string(),
+                command: format!("{PACMAN_BIN} -Qi"),
+                reason: sanitize_for_error(output.stderr.trim()),
             });
         }
         Ok(parse_pacman_qi_output(&output.stdout, packager_marker))
@@ -289,6 +355,13 @@ impl SystemPackageManagerPort for PacmanAdapter<'_> {
 }
 
 pub fn parse_pacman_qi_output(stdout: &str, packager_marker: &str) -> Vec<InstalledPackageSummary> {
+    parse_all_pacman_qi_stanzas(stdout)
+        .into_iter()
+        .filter(|pkg| pkg.packager == packager_marker)
+        .collect()
+}
+
+fn parse_all_pacman_qi_stanzas(stdout: &str) -> Vec<InstalledPackageSummary> {
     let mut results = Vec::new();
     let mut current: HashMap<String, String> = HashMap::new();
     let mut last_key: Option<String> = None;
@@ -296,7 +369,7 @@ pub fn parse_pacman_qi_output(stdout: &str, packager_marker: &str) -> Vec<Instal
     for raw_line in stdout.lines() {
         let line = raw_line.trim_end_matches('\r');
         if line.trim().is_empty() {
-            flush_qi_stanza(&mut current, packager_marker, &mut results);
+            flush_qi_stanza(&mut current, &mut results);
             last_key = None;
             continue;
         }
@@ -319,13 +392,12 @@ pub fn parse_pacman_qi_output(stdout: &str, packager_marker: &str) -> Vec<Instal
         }
     }
 
-    flush_qi_stanza(&mut current, packager_marker, &mut results);
+    flush_qi_stanza(&mut current, &mut results);
     results
 }
 
 fn flush_qi_stanza(
     stanza: &mut HashMap<String, String>,
-    packager_marker: &str,
     results: &mut Vec<InstalledPackageSummary>,
 ) {
     if stanza.is_empty() {
@@ -333,11 +405,7 @@ fn flush_qi_stanza(
     }
 
     let packager = stanza.get("packager").cloned().unwrap_or_default();
-    let matches_packager =
-        packager == packager_marker || packager.contains(PkgInfoMetadata::PACKAGER_EMAIL_MARKER);
-    if matches_packager
-        && let (Some(name), Some(version)) = (stanza.get("name"), stanza.get("version"))
-    {
+    if let (Some(name), Some(version)) = (stanza.get("name"), stanza.get("version")) {
         results.push(InstalledPackageSummary {
             name: name.clone(),
             version: version.clone(),
@@ -348,6 +416,48 @@ fn flush_qi_stanza(
     }
 
     stanza.clear();
+}
+
+fn collect_names_and_provides(stdout: &str, out: &mut HashSet<String>) {
+    let mut in_provides = false;
+    for raw_line in stdout.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            in_provides = false;
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if in_provides {
+                insert_provide_tokens(line, out);
+            }
+            continue;
+        }
+        in_provides = false;
+        if let Some((raw_k, raw_v)) = line.split_once(':') {
+            let key = raw_k.trim();
+            if key.eq_ignore_ascii_case("Name") {
+                let name = raw_v.trim();
+                if !name.is_empty() {
+                    out.insert(name.to_string());
+                }
+            } else if key.eq_ignore_ascii_case("Provides") {
+                in_provides = true;
+                insert_provide_tokens(raw_v, out);
+            }
+        }
+    }
+}
+
+fn insert_provide_tokens(raw_list: &str, out: &mut HashSet<String>) {
+    for token in raw_list.split_whitespace() {
+        if token == "None" {
+            continue;
+        }
+        let base = token.split_once('=').map_or(token, |(name, _)| name);
+        if !base.is_empty() {
+            out.insert(base.to_string());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -363,7 +473,7 @@ mod tests {
     use crate::domain::models::{PackageName, PkgInfoMetadata};
     use crate::domain::ports::{ArchPackageRepository, SystemPackageManagerPort};
 
-    use super::{PacmanAdapter, parse_pacman_qi_output};
+    use super::{PACMAN_BIN, PacmanAdapter, SUDO_BIN, parse_pacman_qi_output};
 
     struct StubPrivileges {
         root: bool,
@@ -399,7 +509,11 @@ mod tests {
                     status_code: Some(if success { 0 } else { 1 }),
                     success,
                     stdout: stdout.to_string(),
-                    stderr: String::new(),
+                    stderr: if success {
+                        String::new()
+                    } else {
+                        "error: failed".to_string()
+                    },
                 }),
             );
         }
@@ -444,19 +558,24 @@ mod tests {
     }
 
     #[test]
-    fn caches_package_existence_resolves_virtuals_and_invalidates_after_mutation()
+    fn caches_package_existence_batches_virtuals_and_invalidates_after_mutation()
     -> Result<(), DomainError> {
         let mut runner = MockRunner::new();
-        runner.stub_capture("pacman -Qq", true, "glibc\ngtk3\n");
+        runner.stub_capture(&format!("{PACMAN_BIN} -Qq"), true, "glibc\ngtk3\n");
         runner.stub_capture(
-            "pacman -Slq",
+            &format!("{PACMAN_BIN} -Slq"),
             true,
             "webkit2gtk-4.1\nlibayatana-appindicator\n",
         );
         runner.stub_capture(
-            "pacman -Sddp --print-format %n -- sdl2",
+            &format!("{PACMAN_BIN} -Qi"),
             true,
-            "sdl2-compat\n",
+            "Name : bash\nProvides : sh\n",
+        );
+        runner.stub_capture(
+            &format!("{PACMAN_BIN} -Si"),
+            true,
+            "Name : sdl2-compat\nProvides : sdl2=2.32.74\n",
         );
 
         let privs = StubPrivileges { root: false };
@@ -464,11 +583,16 @@ mod tests {
 
         assert_eq!(adapter.package_exists("gtk3"), Ok(true));
         assert_eq!(adapter.package_exists("webkit2gtk-4.1"), Ok(true));
+        assert_eq!(adapter.is_native_sync_package("webkit2gtk-4.1"), Ok(true));
+        assert_eq!(adapter.is_native_sync_package("sdl2"), Ok(false));
         assert_eq!(adapter.package_exists("sdl2"), Ok(true));
+        assert_eq!(adapter.package_exists("sh"), Ok(true));
         assert_eq!(adapter.package_exists("nonexistent"), Ok(false));
+        assert_eq!(adapter.package_exists("nonexistent-2"), Ok(false));
         assert_eq!(adapter.package_exists("-evil"), Ok(false));
 
         let call_count_before = runner.captured_calls.borrow().len();
+        assert_eq!(call_count_before, 4);
         assert_eq!(adapter.package_exists("nonexistent"), Ok(false));
         assert_eq!(adapter.package_exists("sdl2"), Ok(true));
         assert_eq!(runner.captured_calls.borrow().len(), call_count_before);
@@ -487,30 +611,53 @@ mod tests {
     }
 
     #[test]
-    fn uses_double_dash_and_sudo_only_when_not_root_for_install_and_uninstall()
-    -> Result<(), DomainError> {
-        let runner = MockRunner::new();
+    fn propagates_pacman_query_errors_instead_of_silencing() {
+        let mut runner = MockRunner::new();
+        runner.stub_capture(&format!("{PACMAN_BIN} -Qq"), false, "");
+        let privs = StubPrivileges { root: false };
+        let adapter = PacmanAdapter::new(&runner, &privs);
+        assert!(matches!(
+            adapter.package_exists("gtk3"),
+            Err(DomainError::CommandExecutionFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn uses_absolute_paths_double_dash_and_sudo_only_when_not_root() -> Result<(), DomainError> {
+        let mut runner = MockRunner::new();
+        runner.stub_capture(&format!("{PACMAN_BIN} -Qq"), true, "demo-app\nbash\n");
+        runner.stub_capture(
+            &format!("{PACMAN_BIN} -Qi -- demo-app"),
+            true,
+            "Name : demo-app\nVersion : 1.0-1\nArchitecture : x86_64\nDescription : Demo\nPackager : install-in-arch <install-in-arch@local>\n",
+        );
         let non_root = StubPrivileges { root: false };
         let adapter = PacmanAdapter::new(&runner, &non_root);
 
         let pkg = PackageName::parse_and_sanitize("demo-app")?;
-        let _ = adapter.is_installed(&pkg)?;
+        assert!(adapter.is_installed(&pkg)?);
+        let virtual_pkg = PackageName::parse_and_sanitize("sh")?;
+        assert!(!adapter.is_installed(&virtual_pkg)?);
+
         adapter.install_local_package(Path::new("/tmp/demo.pkg.tar.zst"), true)?;
         adapter.uninstall_package(&pkg, false, true)?;
         adapter.uninstall_package(&pkg, true, false)?;
 
         assert_eq!(
             runner.captured_calls.borrow().as_slice(),
-            &["pacman -Q -- demo-app".to_string()]
+            &[
+                format!("{PACMAN_BIN} -Qq"),
+                format!("{PACMAN_BIN} -Qi -- demo-app"),
+            ]
         );
 
         let calls = runner.interactive_calls.borrow();
         assert_eq!(
             calls.as_slice(),
             &[
-                "sudo pacman -U --noconfirm -- /tmp/demo.pkg.tar.zst".to_string(),
-                "sudo pacman -Rs --noconfirm -- demo-app".to_string(),
-                "sudo pacman -R -- demo-app".to_string(),
+                format!("{SUDO_BIN} {PACMAN_BIN} -U --noconfirm -- /tmp/demo.pkg.tar.zst"),
+                format!("{SUDO_BIN} {PACMAN_BIN} -Rs --noconfirm -- demo-app"),
+                format!("{SUDO_BIN} {PACMAN_BIN} -R -- demo-app"),
             ]
         );
         Ok(())
@@ -530,15 +677,15 @@ mod tests {
         assert_eq!(
             calls.as_slice(),
             &[
-                "pacman -U -- /tmp/demo.pkg.tar.zst".to_string(),
-                "pacman -Rs -- demo-app".to_string(),
+                format!("{PACMAN_BIN} -U -- /tmp/demo.pkg.tar.zst"),
+                format!("{PACMAN_BIN} -Rs -- demo-app"),
             ]
         );
         Ok(())
     }
 
     #[test]
-    fn parses_pacman_qi_requiring_exact_packager_or_marker_email() {
+    fn parses_pacman_qi_requiring_exact_packager_equality() {
         let stdout = "\
 Name            : regular-pkg
 Version         : 1.0-1
@@ -546,11 +693,11 @@ Architecture    : x86_64
 Description     : Standard repo package
 Packager        : Arch Linux <arch@archlinux.org>
 
-Name            : false-positive-pkg
+Name            : spoofed-email-pkg
 Version         : 1.0-1
 Architecture    : x86_64
-Description     : Mentions tool name in packager note
-Packager        : Someone Else (tested install-in-arch) <someone@example.org>
+Description     : Spoofs marker email in packager string
+Packager        : Evil Attacker <install-in-arch@local>
 
 Name            : epic-games-launcher
 Version         : 1.2.3-1

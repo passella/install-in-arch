@@ -10,6 +10,7 @@ use install_in_arch::adapters::outbound::system_process::{
     SystemClock, SystemCommandRunner, SystemPrivilegeDetector,
 };
 use install_in_arch::domain::ports::{ArchPackageConverterPort, SourcePackageInspectorPort};
+use install_in_arch::domain::sanitizer::sanitize_for_error;
 
 fn main() -> Result<()> {
     let args = CliArgs::parse();
@@ -33,7 +34,9 @@ fn main() -> Result<()> {
 
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
-    dispatcher.dispatch(args, &mut stdout, &mut stderr)?;
+    dispatcher
+        .dispatch(args, &mut stdout, &mut stderr)
+        .map_err(|err| anyhow::Error::msg(sanitize_for_error(&err.to_string())))?;
 
     Ok(())
 }

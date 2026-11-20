@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use crate::domain::error::DomainError;
-use crate::domain::models::{PackageName, SourcePackageFormat, UninstallOptions};
+use crate::domain::models::{PackageName, PkgInfoMetadata, SourcePackageFormat, UninstallOptions};
 use crate::domain::ports::{SourcePackageInspectorPort, SystemPackageManagerPort};
+use crate::domain::sanitizer::{sanitize_for_error, sanitize_terminal_text};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UninstallPackageCommand {
@@ -15,6 +16,7 @@ pub struct UninstallPackageOutcome {
     pub package_name: PackageName,
     pub dry_run: bool,
     pub command_preview: String,
+    pub warnings: Vec<String>,
 }
 
 pub struct UninstallPackageUseCase<'a> {
@@ -39,8 +41,24 @@ impl<'a> UninstallPackageUseCase<'a> {
     ) -> Result<UninstallPackageOutcome, DomainError> {
         let pkg_name = self.resolve_target_package_name(&command.target)?;
 
-        if !self.package_manager.is_installed(&pkg_name)? {
-            return Err(DomainError::PackageNotInstalled(pkg_name.to_string()));
+        let installed = self
+            .package_manager
+            .installed_package_info(&pkg_name)?
+            .ok_or_else(|| DomainError::PackageNotInstalled(pkg_name.to_string()))?;
+
+        let mut warnings = Vec::new();
+        if installed.packager != PkgInfoMetadata::DEFAULT_PACKAGER {
+            if !command.options.allow_replace_foreign {
+                return Err(DomainError::ForeignPackageConflict {
+                    package: pkg_name.to_string(),
+                    packager: sanitize_for_error(&installed.packager),
+                });
+            }
+            warnings.push(format!(
+                "Uninstalling foreign/native package '{}' (packager: '{}') due to --allow-replace-foreign.",
+                pkg_name,
+                sanitize_terminal_text(&installed.packager)
+            ));
         }
 
         let command_preview = self.package_manager.uninstall_command_preview(
@@ -61,13 +79,14 @@ impl<'a> UninstallPackageUseCase<'a> {
             package_name: pkg_name,
             dry_run: command.options.dry_run,
             command_preview,
+            warnings,
         })
     }
 
     fn resolve_target_package_name(&self, target: &str) -> Result<PackageName, DomainError> {
         let trimmed = target.trim();
         if trimmed.is_empty() {
-            return Err(DomainError::InvalidPackageName(target.to_string()));
+            return Err(DomainError::InvalidPackageName(sanitize_for_error(target)));
         }
 
         let as_path = Path::new(trimmed);

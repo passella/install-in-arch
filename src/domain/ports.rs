@@ -31,10 +31,14 @@ pub struct PackageConversionRequest {
     pub replaces: Vec<String>,
     pub build_date: u64,
     pub keep_pkg_dir: Option<PathBuf>,
+    pub allow_suid: bool,
+    pub max_uncompressed_bytes: u64,
+    pub staging_dir: Option<PathBuf>,
 }
 
 pub trait ArchPackageRepository {
     fn package_exists(&self, package_name: &str) -> Result<bool, DomainError>;
+    fn is_native_sync_package(&self, package_name: &str) -> Result<bool, DomainError>;
 }
 
 pub trait SourcePackageInspectorPort {
@@ -55,6 +59,10 @@ pub trait ArchPackageConverterPort {
 
 pub trait SystemPackageManagerPort {
     fn is_installed(&self, package_name: &PackageName) -> Result<bool, DomainError>;
+    fn installed_package_info(
+        &self,
+        package_name: &PackageName,
+    ) -> Result<Option<InstalledPackageSummary>, DomainError>;
     fn install_local_package(
         &self,
         package_archive: &Path,

@@ -1,9 +1,9 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use install_in_arch::adapters::inbound::cli::{CliArgs, CliDispatcher};
+use install_in_arch::adapters::inbound::cli::{CliArgs, CliDispatcher, parse_byte_size};
 use install_in_arch::application::install_package::{InstallPackageCommand, InstallPackageUseCase};
 use install_in_arch::application::list_packages::ListInstalledPackagesUseCase;
 use install_in_arch::application::uninstall_package::{
@@ -12,8 +12,8 @@ use install_in_arch::application::uninstall_package::{
 use install_in_arch::domain::control_parser::parse_dependency_list;
 use install_in_arch::domain::error::DomainError;
 use install_in_arch::domain::models::{
-    ConvertedArchPackage, InstallOptions, InstalledPackageSummary, PackageName, PkgInfoMetadata,
-    SourcePackageFormat, SourcePackageMetadata, UninstallOptions,
+    ConvertedArchPackage, DEFAULT_MAX_UNCOMPRESSED_BYTES, InstallOptions, InstalledPackageSummary,
+    PackageName, PkgInfoMetadata, SourcePackageFormat, SourcePackageMetadata, UninstallOptions,
 };
 use install_in_arch::domain::ports::{
     ArchPackageConverterPort, ArchPackageRepository, ClockPort, PackageConversionRequest,
@@ -31,12 +31,15 @@ impl ClockPort for StubClock {
 
 struct MockArchRepo {
     available: HashSet<String>,
+    sync_native: HashSet<String>,
 }
 
 impl MockArchRepo {
     fn from_names(names: &[&str]) -> Self {
+        let set: HashSet<String> = names.iter().map(|s| (*s).to_string()).collect();
         Self {
-            available: names.iter().map(|s| (*s).to_string()).collect(),
+            available: set.clone(),
+            sync_native: set,
         }
     }
 }
@@ -44,6 +47,10 @@ impl MockArchRepo {
 impl ArchPackageRepository for MockArchRepo {
     fn package_exists(&self, package_name: &str) -> Result<bool, DomainError> {
         Ok(self.available.contains(package_name))
+    }
+
+    fn is_native_sync_package(&self, package_name: &str) -> Result<bool, DomainError> {
+        Ok(self.sync_native.contains(package_name))
     }
 }
 
@@ -136,6 +143,7 @@ impl ArchPackageConverterPort for MockConverter {
                 metadata: meta,
                 payload_entry_count: 5,
                 kept_on_disk: request.keep_pkg_dir.is_some(),
+                warnings: Vec::new(),
             },
             _guard: None,
         })
@@ -143,7 +151,7 @@ impl ArchPackageConverterPort for MockConverter {
 }
 
 struct MockSystemPackageManager {
-    installed_packages: HashSet<String>,
+    installed_packages: HashMap<String, String>,
     managed_packages: Vec<InstalledPackageSummary>,
     fail_is_installed: bool,
     fail_install: bool,
@@ -155,7 +163,7 @@ struct MockSystemPackageManager {
 impl MockSystemPackageManager {
     fn new() -> Self {
         Self {
-            installed_packages: HashSet::new(),
+            installed_packages: HashMap::new(),
             managed_packages: Vec::new(),
             fail_is_installed: false,
             fail_install: false,
@@ -164,17 +172,45 @@ impl MockSystemPackageManager {
             uninstall_calls: RefCell::new(Vec::new()),
         }
     }
+
+    fn insert_managed(&mut self, name: &str) {
+        self.installed_packages.insert(
+            name.to_string(),
+            PkgInfoMetadata::DEFAULT_PACKAGER.to_string(),
+        );
+    }
+
+    fn insert_foreign(&mut self, name: &str, packager: &str) {
+        self.installed_packages
+            .insert(name.to_string(), packager.to_string());
+    }
 }
 
 impl SystemPackageManagerPort for MockSystemPackageManager {
     fn is_installed(&self, package_name: &PackageName) -> Result<bool, DomainError> {
+        Ok(self.installed_package_info(package_name)?.is_some())
+    }
+
+    fn installed_package_info(
+        &self,
+        package_name: &PackageName,
+    ) -> Result<Option<InstalledPackageSummary>, DomainError> {
         if self.fail_is_installed {
             return Err(DomainError::CommandExecutionFailed {
-                command: "pacman -Q".to_string(),
+                command: "/usr/bin/pacman -Qi".to_string(),
                 reason: "db locked".to_string(),
             });
         }
-        Ok(self.installed_packages.contains(package_name.as_str()))
+        Ok(self
+            .installed_packages
+            .get(package_name.as_str())
+            .map(|packager| InstalledPackageSummary {
+                name: package_name.to_string(),
+                version: "1.0-1".to_string(),
+                architecture: "x86_64".to_string(),
+                description: "Mock installed".to_string(),
+                packager: packager.clone(),
+            }))
     }
 
     fn install_local_package(
@@ -187,7 +223,7 @@ impl SystemPackageManagerPort for MockSystemPackageManager {
             .push((package_archive.to_path_buf(), auto_confirm));
         if self.fail_install {
             return Err(DomainError::CommandExecutionFailed {
-                command: "pacman -U".to_string(),
+                command: "/usr/bin/pacman -U".to_string(),
                 reason: "conflict".to_string(),
             });
         }
@@ -205,7 +241,7 @@ impl SystemPackageManagerPort for MockSystemPackageManager {
             .push((package_name.to_string(), keep_deps, auto_confirm));
         if self.fail_uninstall {
             return Err(DomainError::CommandExecutionFailed {
-                command: "pacman -Rs".to_string(),
+                command: "/usr/bin/pacman -Rs".to_string(),
                 reason: "required by other".to_string(),
             });
         }
@@ -219,16 +255,22 @@ impl SystemPackageManagerPort for MockSystemPackageManager {
         Ok(self
             .managed_packages
             .iter()
-            .filter(|p| p.packager.contains(packager_marker))
+            .filter(|p| p.packager == packager_marker)
             .cloned()
             .collect())
     }
 
     fn install_command_preview(&self, package_archive: &Path, auto_confirm: bool) -> String {
         if auto_confirm {
-            format!("sudo pacman -U --noconfirm {}", package_archive.display())
+            format!(
+                "/usr/bin/sudo /usr/bin/pacman -U --noconfirm -- {}",
+                package_archive.display()
+            )
         } else {
-            format!("sudo pacman -U {}", package_archive.display())
+            format!(
+                "/usr/bin/sudo /usr/bin/pacman -U -- {}",
+                package_archive.display()
+            )
         }
     }
 
@@ -240,9 +282,9 @@ impl SystemPackageManagerPort for MockSystemPackageManager {
     ) -> String {
         let flag = if keep_deps { "-R" } else { "-Rs" };
         if auto_confirm {
-            format!("sudo pacman {flag} --noconfirm {package_name}")
+            format!("/usr/bin/sudo /usr/bin/pacman {flag} --noconfirm -- {package_name}")
         } else {
-            format!("sudo pacman {flag} {package_name}")
+            format!("/usr/bin/sudo /usr/bin/pacman {flag} -- {package_name}")
         }
     }
 }
@@ -303,13 +345,7 @@ fn install_use_case_propagates_inspector_converter_and_pacman_failures() {
 
     let err = uc.execute(InstallPackageCommand {
         source_path: PathBuf::from("missing.deb"),
-        options: InstallOptions {
-            ignore_deps: false,
-            strict_deps: false,
-            dry_run: false,
-            auto_confirm: false,
-            keep_pkg_dir: None,
-        },
+        options: InstallOptions::default(),
     });
     assert!(matches!(err, Err(DomainError::InputFileNotFound(_))));
 
@@ -326,13 +362,7 @@ fn install_use_case_propagates_inspector_converter_and_pacman_failures() {
     assert!(matches!(
         uc_conv_fail.execute(InstallPackageCommand {
             source_path: PathBuf::from("app.deb"),
-            options: InstallOptions {
-                ignore_deps: false,
-                strict_deps: false,
-                dry_run: false,
-                auto_confirm: false,
-                keep_pkg_dir: None,
-            },
+            options: InstallOptions::default(),
         }),
         Err(DomainError::Io { .. })
     ));
@@ -345,11 +375,8 @@ fn install_use_case_propagates_inspector_converter_and_pacman_failures() {
         uc_pm_fail.execute(InstallPackageCommand {
             source_path: PathBuf::from("app.deb"),
             options: InstallOptions {
-                ignore_deps: false,
-                strict_deps: false,
-                dry_run: false,
                 auto_confirm: true,
-                keep_pkg_dir: None,
+                ..InstallOptions::default()
             },
         }),
         Err(DomainError::CommandExecutionFailed { .. })
@@ -372,13 +399,7 @@ fn install_use_case_rejects_unsupported_formats_and_strict_unresolved_deps() {
 
     let unsupported_err = uc.execute(InstallPackageCommand {
         source_path: PathBuf::from("launcher.apk"),
-        options: InstallOptions {
-            ignore_deps: false,
-            strict_deps: false,
-            dry_run: false,
-            auto_confirm: false,
-            keep_pkg_dir: None,
-        },
+        options: InstallOptions::default(),
     });
     assert_eq!(
         unsupported_err,
@@ -387,13 +408,7 @@ fn install_use_case_rejects_unsupported_formats_and_strict_unresolved_deps() {
 
     let missing_rpm_adapter_err = uc.execute(InstallPackageCommand {
         source_path: PathBuf::from("launcher.rpm"),
-        options: InstallOptions {
-            ignore_deps: false,
-            strict_deps: false,
-            dry_run: false,
-            auto_confirm: false,
-            keep_pkg_dir: None,
-        },
+        options: InstallOptions::default(),
     });
     assert_eq!(
         missing_rpm_adapter_err,
@@ -403,11 +418,8 @@ fn install_use_case_rejects_unsupported_formats_and_strict_unresolved_deps() {
     let strict_err = uc.execute(InstallPackageCommand {
         source_path: PathBuf::from("launcher.deb"),
         options: InstallOptions {
-            ignore_deps: false,
             strict_deps: true,
-            dry_run: false,
-            auto_confirm: false,
-            keep_pkg_dir: None,
+            ..InstallOptions::default()
         },
     });
     assert_eq!(
@@ -441,10 +453,9 @@ fn install_use_case_handles_dry_run_ignore_deps_keep_pkg_and_happy_path_for_deb_
         source_path: PathBuf::from("epic.deb"),
         options: InstallOptions {
             ignore_deps: true,
-            strict_deps: false,
             dry_run: true,
-            auto_confirm: false,
             keep_pkg_dir: Some(PathBuf::from("/tmp/kept")),
+            ..InstallOptions::default()
         },
     });
     assert!(dry_outcome.is_ok());
@@ -464,11 +475,8 @@ fn install_use_case_handles_dry_run_ignore_deps_keep_pkg_and_happy_path_for_deb_
     let live_outcome = uc.execute(InstallPackageCommand {
         source_path: PathBuf::from("epic.deb"),
         options: InstallOptions {
-            ignore_deps: false,
-            strict_deps: false,
-            dry_run: false,
             auto_confirm: true,
-            keep_pkg_dir: None,
+            ..InstallOptions::default()
         },
     });
     assert!(live_outcome.is_ok());
@@ -491,11 +499,9 @@ fn install_use_case_handles_dry_run_ignore_deps_keep_pkg_and_happy_path_for_deb_
     let rpm_outcome = uc.execute(InstallPackageCommand {
         source_path: PathBuf::from("fedora-tool.rpm"),
         options: InstallOptions {
-            ignore_deps: false,
-            strict_deps: false,
             dry_run: true,
-            auto_confirm: false,
             keep_pkg_dir: Some(PathBuf::from("/tmp/kept-rpm")),
+            ..InstallOptions::default()
         },
     });
     assert!(rpm_outcome.is_ok());
@@ -520,6 +526,193 @@ fn install_use_case_handles_dry_run_ignore_deps_keep_pkg_and_happy_path_for_deb_
 }
 
 #[test]
+fn foreign_package_guard_blocks_replacement_and_removal_until_explicit_opt_in() {
+    let mut foreign_meta = sample_control_metadata();
+    foreign_meta.package = "bash".to_string();
+    foreign_meta.maintainer_scripts.clear();
+
+    let deb_inspector = MockPackageInspector {
+        format: SourcePackageFormat::Deb,
+        metadata: Ok(foreign_meta),
+    };
+    let converter = MockConverter::new();
+    let repo = MockArchRepo::from_names(&["glibc", "webkit2gtk-4.1", "bash", "systemd"]);
+    let mut pm = MockSystemPackageManager::new();
+    pm.insert_foreign("bash", "Arch Linux <arch@archlinux.org>");
+    pm.insert_foreign("spoofed", "Evil Attacker <install-in-arch@local>");
+    pm.insert_managed("epic-app");
+
+    let clock = StubClock(1_700_000_000);
+    let inspectors: [&dyn SourcePackageInspectorPort; 1] = [&deb_inspector];
+    let converters: [&dyn ArchPackageConverterPort; 1] = [&converter];
+    let install_uc = InstallPackageUseCase::new(&inspectors, &converters, &repo, &pm, &clock);
+
+    let blocked_install = install_uc.execute(InstallPackageCommand {
+        source_path: PathBuf::from("hijack.deb"),
+        options: InstallOptions::default(),
+    });
+    assert!(matches!(
+        blocked_install,
+        Err(DomainError::ForeignPackageConflict { .. })
+    ));
+    assert!(pm.install_calls.borrow().is_empty());
+
+    let allowed_install = install_uc.execute(InstallPackageCommand {
+        source_path: PathBuf::from("hijack.deb"),
+        options: InstallOptions {
+            allow_replace_foreign: true,
+            ..InstallOptions::default()
+        },
+    });
+    assert!(allowed_install.is_ok());
+    if let Ok(out) = allowed_install {
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("--allow-replace-foreign"))
+        );
+    }
+
+    let mut sync_only_meta = sample_control_metadata();
+    sync_only_meta.package = "systemd".to_string();
+    let sync_inspector = MockPackageInspector {
+        format: SourcePackageFormat::Deb,
+        metadata: Ok(sync_only_meta),
+    };
+    let sync_inspectors: [&dyn SourcePackageInspectorPort; 1] = [&sync_inspector];
+    let sync_uc = InstallPackageUseCase::new(&sync_inspectors, &converters, &repo, &pm, &clock);
+    assert!(matches!(
+        sync_uc.execute(InstallPackageCommand {
+            source_path: PathBuf::from("systemd.deb"),
+            options: InstallOptions::default(),
+        }),
+        Err(DomainError::ForeignPackageConflict { .. })
+    ));
+
+    let mut managed_meta = sample_control_metadata();
+    managed_meta.package = "epic-app".to_string();
+    let managed_inspector = MockPackageInspector {
+        format: SourcePackageFormat::Deb,
+        metadata: Ok(managed_meta),
+    };
+    let managed_inspectors: [&dyn SourcePackageInspectorPort; 1] = [&managed_inspector];
+    let managed_uc =
+        InstallPackageUseCase::new(&managed_inspectors, &converters, &repo, &pm, &clock);
+    assert!(
+        managed_uc
+            .execute(InstallPackageCommand {
+                source_path: PathBuf::from("epic.deb"),
+                options: InstallOptions {
+                    dry_run: true,
+                    ..InstallOptions::default()
+                },
+            })
+            .is_ok()
+    );
+
+    let uninstall_uc = UninstallPackageUseCase::new(&inspectors, &pm);
+    assert!(matches!(
+        uninstall_uc.execute(UninstallPackageCommand {
+            target: "bash".to_string(),
+            options: UninstallOptions::default(),
+        }),
+        Err(DomainError::ForeignPackageConflict { .. })
+    ));
+    assert!(matches!(
+        uninstall_uc.execute(UninstallPackageCommand {
+            target: "spoofed".to_string(),
+            options: UninstallOptions::default(),
+        }),
+        Err(DomainError::ForeignPackageConflict { .. })
+    ));
+
+    let allowed_uninstall = uninstall_uc.execute(UninstallPackageCommand {
+        target: "bash".to_string(),
+        options: UninstallOptions {
+            allow_replace_foreign: true,
+            ..UninstallOptions::default()
+        },
+    });
+    assert!(allowed_uninstall.is_ok());
+    if let Ok(out) = allowed_uninstall {
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("--allow-replace-foreign"))
+        );
+    }
+}
+
+#[test]
+fn filters_protected_system_and_foreign_conflicts_and_obsoletes_in_rpm_install() {
+    let mut rpm_meta = sample_rpm_metadata();
+    rpm_meta.conflicts = vec![
+        "bash".to_string(),
+        "pacman".to_string(),
+        "custom-foreign-app".to_string(),
+        "safe-old-tool".to_string(),
+    ];
+    rpm_meta.obsoletes = vec![
+        "glibc".to_string(),
+        "systemd".to_string(),
+        "old-tool".to_string(),
+    ];
+
+    let rpm_inspector = MockPackageInspector {
+        format: SourcePackageFormat::Rpm,
+        metadata: Ok(rpm_meta),
+    };
+    let converter = MockConverter::with_rpm();
+    let repo = MockArchRepo::from_names(&["glibc", "sh", "bash", "pacman", "systemd"]);
+    let mut pm = MockSystemPackageManager::new();
+    pm.insert_foreign("custom-foreign-app", "AUR Builder <aur@example.org>");
+    let clock = StubClock(1_700_000_000);
+    let inspectors: [&dyn SourcePackageInspectorPort; 1] = [&rpm_inspector];
+    let converters: [&dyn ArchPackageConverterPort; 1] = [&converter];
+    let uc = InstallPackageUseCase::new(&inspectors, &converters, &repo, &pm, &clock);
+
+    let default_out = uc.execute(InstallPackageCommand {
+        source_path: PathBuf::from("tool.rpm"),
+        options: InstallOptions {
+            dry_run: true,
+            ..InstallOptions::default()
+        },
+    });
+    assert!(default_out.is_ok());
+    if let Ok(out) = default_out {
+        assert_eq!(out.metadata.conflicts, vec!["safe-old-tool"]);
+        assert_eq!(out.metadata.replaces, vec!["old-tool"]);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("protected system package 'bash'"))
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("foreign/native package 'custom-foreign-app'"))
+        );
+    }
+
+    let opted_out = uc.execute(InstallPackageCommand {
+        source_path: PathBuf::from("tool.rpm"),
+        options: InstallOptions {
+            dry_run: true,
+            allow_replace_foreign: true,
+            ..InstallOptions::default()
+        },
+    });
+    assert!(opted_out.is_ok());
+    if let Ok(out) = opted_out {
+        assert_eq!(
+            out.metadata.conflicts,
+            vec!["custom-foreign-app", "safe-old-tool"]
+        );
+        assert_eq!(out.metadata.replaces, vec!["old-tool"]);
+    }
+}
+
+#[test]
 fn uninstall_use_case_covers_errors_not_installed_deb_rpm_and_direct_name_paths() {
     let deb_inspector = MockPackageInspector {
         format: SourcePackageFormat::Deb,
@@ -537,11 +730,7 @@ fn uninstall_use_case_covers_errors_not_installed_deb_rpm_and_direct_name_paths(
     assert!(matches!(
         uc_fail.execute(UninstallPackageCommand {
             target: "epic-app".to_string(),
-            options: UninstallOptions {
-                dry_run: false,
-                auto_confirm: false,
-                keep_deps: false,
-            },
+            options: UninstallOptions::default(),
         }),
         Err(DomainError::CommandExecutionFailed { .. })
     ));
@@ -551,31 +740,21 @@ fn uninstall_use_case_covers_errors_not_installed_deb_rpm_and_direct_name_paths(
     assert_eq!(
         uc_missing.execute(UninstallPackageCommand {
             target: "epic-app".to_string(),
-            options: UninstallOptions {
-                dry_run: false,
-                auto_confirm: false,
-                keep_deps: false,
-            },
+            options: UninstallOptions::default(),
         }),
         Err(DomainError::PackageNotInstalled("epic-app".to_string()))
     );
     assert_eq!(
         uc_missing.execute(UninstallPackageCommand {
             target: "legacy.rpm".to_string(),
-            options: UninstallOptions {
-                dry_run: false,
-                auto_confirm: false,
-                keep_deps: false,
-            },
+            options: UninstallOptions::default(),
         }),
         Err(DomainError::UnsupportedPackageFormat("rpm".to_string()))
     );
 
-    pm_empty.installed_packages.insert("epic-app".to_string());
-    pm_empty
-        .installed_packages
-        .insert("fedora-tool".to_string());
-    pm_empty.installed_packages.insert("tool.v2".to_string());
+    pm_empty.insert_managed("epic-app");
+    pm_empty.insert_managed("fedora-tool");
+    pm_empty.insert_managed("tool.v2");
     let inspectors: [&dyn SourcePackageInspectorPort; 2] = [&deb_inspector, &rpm_inspector];
     let uc_ok = UninstallPackageUseCase::new(&inspectors, &pm_empty);
 
@@ -583,8 +762,7 @@ fn uninstall_use_case_covers_errors_not_installed_deb_rpm_and_direct_name_paths(
         target: "/tmp/epic.deb".to_string(),
         options: UninstallOptions {
             dry_run: true,
-            auto_confirm: false,
-            keep_deps: false,
+            ..UninstallOptions::default()
         },
     });
     assert!(from_deb_dry.is_ok());
@@ -597,8 +775,7 @@ fn uninstall_use_case_covers_errors_not_installed_deb_rpm_and_direct_name_paths(
         target: "/tmp/fedora-tool.rpm".to_string(),
         options: UninstallOptions {
             dry_run: true,
-            auto_confirm: false,
-            keep_deps: false,
+            ..UninstallOptions::default()
         },
     });
     assert!(from_rpm_dry.is_ok());
@@ -614,6 +791,7 @@ fn uninstall_use_case_covers_errors_not_installed_deb_rpm_and_direct_name_paths(
             dry_run: false,
             auto_confirm: true,
             keep_deps: true,
+            allow_replace_foreign: false,
         },
     });
     assert!(from_dotted_name.is_ok());
@@ -624,7 +802,7 @@ fn uninstall_use_case_covers_errors_not_installed_deb_rpm_and_direct_name_paths(
 }
 
 #[test]
-fn list_use_case_and_cli_dispatcher_cover_cli_flags_and_output() {
+fn list_use_case_and_cli_dispatcher_sanitize_outputs_and_parse_security_flags() {
     let inspector = MockPackageInspector {
         format: SourcePackageFormat::Deb,
         metadata: Ok(sample_control_metadata()),
@@ -653,8 +831,15 @@ fn list_use_case_and_cli_dispatcher_cover_cli_flags_and_output() {
         name: "epic-app".to_string(),
         version: "2.0.1-3".to_string(),
         architecture: "x86_64".to_string(),
-        description: "Sample launcher".to_string(),
+        description: "\x1b[31mEvil\x1b[0m\u{202E} Launcher".to_string(),
         packager: PkgInfoMetadata::DEFAULT_PACKAGER.to_string(),
+    });
+    pm.managed_packages.push(InstalledPackageSummary {
+        name: "spoofed".to_string(),
+        version: "1.0-1".to_string(),
+        architecture: "x86_64".to_string(),
+        description: "Spoofed email".to_string(),
+        packager: "Evil <install-in-arch@local>".to_string(),
     });
     pm.managed_packages.push(InstalledPackageSummary {
         name: "arch-native".to_string(),
@@ -671,8 +856,18 @@ fn list_use_case_and_cli_dispatcher_cover_cli_flags_and_output() {
         assert!(dispatcher.dispatch(args, &mut out, &mut err).is_ok());
     }
     let list_output = String::from_utf8_lossy(&out);
-    assert!(list_output.contains("epic-app 2.0.1-3 (x86_64)"));
+    assert!(list_output.contains("epic-app 2.0.1-3 (x86_64) - Evil Launcher"));
+    assert!(!list_output.contains('\x1b'));
+    assert!(!list_output.contains('\u{202E}'));
+    assert!(!list_output.contains("spoofed"));
     assert!(!list_output.contains("arch-native"));
+
+    assert_eq!(parse_byte_size("512M"), Ok(512 * 1024 * 1024));
+    assert_eq!(parse_byte_size("2GiB"), Ok(2 * 1024 * 1024 * 1024));
+    assert_eq!(parse_byte_size("1024"), Ok(1024));
+    assert!(parse_byte_size("0").is_err());
+    assert!(parse_byte_size("0G").is_err());
+    assert!(parse_byte_size("-10M").is_err());
 
     assert!(CliArgs::try_parse_from(["install-in-arch"]).is_err());
     assert!(
@@ -681,26 +876,36 @@ fn list_use_case_and_cli_dispatcher_cover_cli_flags_and_output() {
     );
     assert!(CliArgs::try_parse_from(["install-in-arch", "--list", "-u", "foo"]).is_err());
     assert!(
-        CliArgs::try_parse_from([
-            "install-in-arch",
-            "epic.deb",
-            "--dry-run",
-            "--keep-pkg",
-            "/tmp/out",
-            "-y"
-        ])
-        .is_ok()
+        CliArgs::try_parse_from(["install-in-arch", "--list", "--allow-replace-foreign"]).is_err()
     );
-    assert!(
-        CliArgs::try_parse_from([
-            "install-in-arch",
-            "epic.rpm",
-            "--dry-run",
-            "--keep-pkg",
-            "/tmp/out",
-            "-y"
-        ])
-        .is_ok()
-    );
-    assert!(CliArgs::try_parse_from(["install-in-arch", "-u", "epic.rpm", "--keep-deps"]).is_ok());
+    assert!(CliArgs::try_parse_from(["install-in-arch", "--list", "--allow-suid"]).is_err());
+
+    let parsed = CliArgs::try_parse_from([
+        "install-in-arch",
+        "epic.deb",
+        "--dry-run",
+        "--keep-pkg",
+        "/tmp/out",
+        "--allow-replace-foreign",
+        "--allow-suid",
+        "--max-uncompressed-size",
+        "512M",
+        "--staging-dir",
+        "/tmp/stage",
+        "-y",
+    ]);
+    assert!(parsed.is_ok());
+    if let Ok(args) = parsed {
+        assert!(args.allow_replace_foreign);
+        assert!(args.allow_suid);
+        assert_eq!(args.max_uncompressed_size, 512 * 1024 * 1024);
+        assert_eq!(args.staging_dir, Some(PathBuf::from("/tmp/stage")));
+    }
+
+    let default_parsed = CliArgs::try_parse_from(["install-in-arch", "epic.rpm"]);
+    if let Ok(args) = default_parsed {
+        assert_eq!(args.max_uncompressed_size, DEFAULT_MAX_UNCOMPRESSED_BYTES);
+        assert!(!args.allow_replace_foreign);
+        assert!(!args.allow_suid);
+    }
 }

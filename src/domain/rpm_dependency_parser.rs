@@ -1,8 +1,85 @@
 use std::collections::HashSet;
 
-use crate::domain::control_parser::sanitize_single_line_value;
+use crate::domain::control_parser::MAX_DEPENDENCY_CLAUSES;
 use crate::domain::error::DomainError;
 use crate::domain::models::{DependencyAlternative, DependencyClause, PackageName};
+use crate::domain::sanitizer::{sanitize_for_error, sanitize_single_line_value};
+
+pub const MAX_RELATION_NAMES: usize = 1024;
+
+pub fn is_protected_system_package(package_name: &str) -> bool {
+    matches!(
+        package_name,
+        "archlinux-keyring"
+            | "base"
+            | "base-devel"
+            | "bash"
+            | "btrfs-progs"
+            | "bzip2"
+            | "ca-certificates"
+            | "ca-certificates-mozilla"
+            | "ca-certificates-utils"
+            | "coreutils"
+            | "curl"
+            | "dbus"
+            | "dhcpcd"
+            | "dracut"
+            | "e2fsprogs"
+            | "efibootmgr"
+            | "expat"
+            | "filesystem"
+            | "findutils"
+            | "gawk"
+            | "gcc-libs"
+            | "glibc"
+            | "gnupg"
+            | "grep"
+            | "grub"
+            | "gzip"
+            | "iana-etc"
+            | "iproute2"
+            | "kmod"
+            | "libarchive"
+            | "libcap"
+            | "libelf"
+            | "libnghttp2"
+            | "libseccomp"
+            | "linux"
+            | "linux-firmware"
+            | "linux-hardened"
+            | "linux-lts"
+            | "linux-zen"
+            | "mkinitcpio"
+            | "ncurses"
+            | "networkmanager"
+            | "openssh"
+            | "openssl"
+            | "pacman"
+            | "pacman-contrib"
+            | "pam"
+            | "pambase"
+            | "polkit"
+            | "procps-ng"
+            | "psmisc"
+            | "readline"
+            | "sed"
+            | "sh"
+            | "shadow"
+            | "sqlite"
+            | "sudo"
+            | "systemd"
+            | "systemd-libs"
+            | "systemd-sysvcompat"
+            | "tar"
+            | "tzdata"
+            | "util-linux"
+            | "util-linux-libs"
+            | "xfsprogs"
+            | "xz"
+            | "zlib"
+            | "zstd"
+    )
+}
 
 pub fn parse_rpm_requires(raw_requires: &[String]) -> Result<Vec<DependencyClause>, DomainError> {
     let mut clauses = Vec::new();
@@ -13,8 +90,16 @@ pub fn parse_rpm_requires(raw_requires: &[String]) -> Result<Vec<DependencyClaus
         }
         if clean.starts_with('-') {
             return Err(DomainError::InvalidControlMetadata(format!(
-                "dependency name cannot start with '-': '{clean}'"
+                "dependency name cannot start with '-': '{}'",
+                sanitize_for_error(&clean)
             )));
+        }
+        if clauses.len() >= MAX_DEPENDENCY_CLAUSES {
+            return Err(DomainError::ResourceLimitExceeded {
+                resource: "RPM dependency clauses".to_string(),
+                limit: MAX_DEPENDENCY_CLAUSES as u64,
+                context: "parsing RPM Requires".to_string(),
+            });
         }
         parse_rpm_requirement_expr(&clean, &mut clauses)?;
     }
@@ -34,7 +119,8 @@ pub fn sanitize_rpm_relation_names(
         }
         if clean.starts_with('-') {
             return Err(DomainError::InvalidControlMetadata(format!(
-                "package relation name cannot start with '-': '{clean}'"
+                "package relation name cannot start with '-': '{}'",
+                sanitize_for_error(&clean)
             )));
         }
         if is_internal_rpm_capability(&clean) || clean.starts_with('(') || clean.starts_with('/') {
@@ -43,7 +129,8 @@ pub fn sanitize_rpm_relation_names(
         let name = extract_rpm_requirement_name(&clean);
         if name.starts_with('-') {
             return Err(DomainError::InvalidControlMetadata(format!(
-                "package relation name cannot start with '-': '{name}'"
+                "package relation name cannot start with '-': '{}'",
+                sanitize_for_error(&name)
             )));
         }
         if name.is_empty() || name.contains(".so") || name.contains('/') {
@@ -52,6 +139,13 @@ pub fn sanitize_rpm_relation_names(
         if let Ok(pkg_name) = PackageName::parse_and_sanitize(&name) {
             let value = pkg_name.as_str();
             if self_pkg_name != Some(value) && seen.insert(value.to_string()) {
+                if out.len() >= MAX_RELATION_NAMES {
+                    return Err(DomainError::ResourceLimitExceeded {
+                        resource: "RPM relation entries".to_string(),
+                        limit: MAX_RELATION_NAMES as u64,
+                        context: "parsing RPM Conflicts/Obsoletes".to_string(),
+                    });
+                }
                 out.push(value.to_string());
             }
         }
@@ -96,7 +190,8 @@ fn parse_rpm_requirement_expr_inner(
 ) -> Result<(), DomainError> {
     if depth > MAX_EXPR_DEPTH {
         return Err(DomainError::InvalidControlMetadata(format!(
-            "RPM dependency expression exceeds maximum nesting depth ({MAX_EXPR_DEPTH}): '{expr}'"
+            "RPM dependency expression exceeds maximum nesting depth ({MAX_EXPR_DEPTH}): '{}'",
+            sanitize_for_error(expr)
         )));
     }
 
@@ -106,7 +201,8 @@ fn parse_rpm_requirement_expr_inner(
     }
     if trimmed.starts_with('-') {
         return Err(DomainError::InvalidControlMetadata(format!(
-            "dependency name cannot start with '-': '{trimmed}'"
+            "dependency name cannot start with '-': '{}'",
+            sanitize_for_error(trimmed)
         )));
     }
     reject_hyphen_tokens(trimmed)?;
@@ -170,14 +266,16 @@ fn parse_rpm_requirement_expr_inner(
         }
 
         return Err(DomainError::InvalidControlMetadata(format!(
-            "malformed RPM dependency expression '{trimmed}'"
+            "malformed RPM dependency expression '{}'",
+            sanitize_for_error(trimmed)
         )));
     }
 
     let package_name = extract_rpm_requirement_name(trimmed);
     if package_name.starts_with('-') {
         return Err(DomainError::InvalidControlMetadata(format!(
-            "dependency name cannot start with '-': '{package_name}'"
+            "dependency name cannot start with '-': '{}'",
+            sanitize_for_error(&package_name)
         )));
     }
     if is_internal_rpm_capability(&package_name) || package_name.is_empty() {
@@ -201,7 +299,8 @@ fn collect_alternatives_from_expr_inner(
 ) -> Result<(), DomainError> {
     if depth > MAX_EXPR_DEPTH {
         return Err(DomainError::InvalidControlMetadata(format!(
-            "RPM dependency expression exceeds maximum nesting depth ({MAX_EXPR_DEPTH}): '{expr}'"
+            "RPM dependency expression exceeds maximum nesting depth ({MAX_EXPR_DEPTH}): '{}'",
+            sanitize_for_error(expr)
         )));
     }
 
@@ -211,7 +310,8 @@ fn collect_alternatives_from_expr_inner(
     }
     if trimmed.starts_with('-') {
         return Err(DomainError::InvalidControlMetadata(format!(
-            "dependency name cannot start with '-': '{trimmed}'"
+            "dependency name cannot start with '-': '{}'",
+            sanitize_for_error(trimmed)
         )));
     }
     reject_hyphen_tokens(trimmed)?;
@@ -256,14 +356,16 @@ fn collect_alternatives_from_expr_inner(
         }
 
         return Err(DomainError::InvalidControlMetadata(format!(
-            "malformed RPM dependency expression '{trimmed}'"
+            "malformed RPM dependency expression '{}'",
+            sanitize_for_error(trimmed)
         )));
     }
 
     let package_name = extract_rpm_requirement_name(trimmed);
     if package_name.starts_with('-') {
         return Err(DomainError::InvalidControlMetadata(format!(
-            "dependency name cannot start with '-': '{package_name}'"
+            "dependency name cannot start with '-': '{}'",
+            sanitize_for_error(&package_name)
         )));
     }
     if !package_name.is_empty() && !is_internal_rpm_capability(&package_name) {
@@ -296,7 +398,8 @@ fn reject_dangling_rich_operator(target: &str) -> Result<(), DomainError> {
         .any(|kw| target.eq_ignore_ascii_case(kw))
     {
         return Err(DomainError::InvalidControlMetadata(format!(
-            "dangling operator '{target}' in RPM dependency"
+            "dangling operator '{}' in RPM dependency",
+            sanitize_for_error(target)
         )));
     }
 
@@ -314,7 +417,9 @@ fn reject_dangling_rich_operator(target: &str) -> Result<(), DomainError> {
             .any(|kw| word.eq_ignore_ascii_case(kw))
     {
         return Err(DomainError::InvalidControlMetadata(format!(
-            "dangling leading operator '{word}' in RPM dependency '{target}'"
+            "dangling leading operator '{}' in RPM dependency '{}'",
+            sanitize_for_error(word),
+            sanitize_for_error(target)
         )));
     }
 
@@ -331,7 +436,9 @@ fn reject_dangling_rich_operator(target: &str) -> Result<(), DomainError> {
             .any(|kw| word.eq_ignore_ascii_case(kw))
     {
         return Err(DomainError::InvalidControlMetadata(format!(
-            "dangling trailing operator '{word}' in RPM dependency '{target}'"
+            "dangling trailing operator '{}' in RPM dependency '{}'",
+            sanitize_for_error(word),
+            sanitize_for_error(target)
         )));
     }
 
@@ -342,7 +449,8 @@ fn reject_hyphen_tokens(expr: &str) -> Result<(), DomainError> {
     for token in expr.split(|c: char| c.is_ascii_whitespace() || c == '(' || c == ')') {
         if token.starts_with('-') {
             return Err(DomainError::InvalidControlMetadata(format!(
-                "dependency name cannot start with '-': '{token}'"
+                "dependency name cannot start with '-': '{}'",
+                sanitize_for_error(token)
             )));
         }
     }
@@ -357,7 +465,8 @@ fn validate_balanced_parens(input: &str) -> Result<(), DomainError> {
         } else if ch == ')' {
             if depth == 0 {
                 return Err(DomainError::InvalidControlMetadata(format!(
-                    "unbalanced parentheses in RPM dependency '{input}'"
+                    "unbalanced parentheses in RPM dependency '{}'",
+                    sanitize_for_error(input)
                 )));
             }
             depth -= 1;
@@ -365,7 +474,8 @@ fn validate_balanced_parens(input: &str) -> Result<(), DomainError> {
     }
     if depth != 0 {
         return Err(DomainError::InvalidControlMetadata(format!(
-            "unbalanced parentheses in RPM dependency '{input}'"
+            "unbalanced parentheses in RPM dependency '{}'",
+            sanitize_for_error(input)
         )));
     }
     Ok(())
@@ -410,13 +520,15 @@ fn split_rich_operator<'a>(
     for (start, end) in spans {
         let slice = input.get(last..start).ok_or_else(|| {
             DomainError::InvalidControlMetadata(format!(
-                "invalid rich dependency boundary in '{input}'"
+                "invalid rich dependency boundary in '{}'",
+                sanitize_for_error(input)
             ))
         })?;
         let trimmed = slice.trim();
         if trimmed.is_empty() {
             return Err(DomainError::InvalidControlMetadata(format!(
-                "empty operand before '{keyword}' in RPM dependency '{input}'"
+                "empty operand before '{keyword}' in RPM dependency '{}'",
+                sanitize_for_error(input)
             )));
         }
         parts.push(trimmed);
@@ -424,13 +536,15 @@ fn split_rich_operator<'a>(
     }
     let tail = input.get(last..).ok_or_else(|| {
         DomainError::InvalidControlMetadata(format!(
-            "invalid rich dependency boundary in '{input}'"
+            "invalid rich dependency boundary in '{}'",
+            sanitize_for_error(input)
         ))
     })?;
     let trimmed = tail.trim();
     if trimmed.is_empty() {
         return Err(DomainError::InvalidControlMetadata(format!(
-            "empty operand after '{keyword}' in RPM dependency '{input}'"
+            "empty operand after '{keyword}' in RPM dependency '{}'",
+            sanitize_for_error(input)
         )));
     }
     parts.push(trimmed);

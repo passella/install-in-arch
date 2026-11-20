@@ -1,0 +1,52 @@
+[package]
+name = "install-in-arch-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.install-in-arch]
+path = ".."
+
+[[bin]]
+name = "deb_ar_parser"
+path = "fuzz_targets/deb_ar_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpm_header_parser"
+path = "fuzz_targets/rpm_header_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_parser"
+path = "fuzz_targets/control_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpm_dependency_parser"
+path = "fuzz_targets/rpm_dependency_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path_normalizer"
+path = "fuzz_targets/path_normalizer.rs"
+test = false
+doc = false
+bench = false

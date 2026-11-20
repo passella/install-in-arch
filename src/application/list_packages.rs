@@ -12,7 +12,12 @@ impl<'a> ListInstalledPackagesUseCase<'a> {
     }
 
     pub fn execute(&self) -> Result<Vec<InstalledPackageSummary>, DomainError> {
-        self.package_manager
-            .list_managed_packages(PkgInfoMetadata::DEFAULT_PACKAGER)
+        let packages = self
+            .package_manager
+            .list_managed_packages(PkgInfoMetadata::DEFAULT_PACKAGER)?;
+        Ok(packages
+            .into_iter()
+            .filter(|pkg| pkg.packager == PkgInfoMetadata::DEFAULT_PACKAGER)
+            .collect())
     }
 }

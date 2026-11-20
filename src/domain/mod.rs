@@ -6,3 +6,4 @@ pub mod path_normalizer;
 pub mod pkg_formatter;
 pub mod ports;
 pub mod rpm_dependency_parser;
+pub mod sanitizer;

@@ -2,6 +2,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::domain::error::DomainError;
+use crate::domain::sanitizer::{is_bidi_or_invisible_format, sanitize_for_error};
+
+pub const DEFAULT_MAX_UNCOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PackageName(String);
@@ -10,7 +13,7 @@ impl PackageName {
     pub fn parse_and_sanitize(raw: &str) -> Result<Self, DomainError> {
         let lower = raw.trim().to_ascii_lowercase();
         if lower.is_empty() {
-            return Err(DomainError::InvalidPackageName(raw.to_string()));
+            return Err(DomainError::InvalidPackageName(sanitize_for_error(raw)));
         }
 
         let mut sanitized = String::with_capacity(lower.len());
@@ -27,7 +30,7 @@ impl PackageName {
 
         let trimmed = sanitized.trim_start_matches(['-', '.']);
         if trimmed.is_empty() {
-            return Err(DomainError::InvalidPackageName(raw.to_string()));
+            return Err(DomainError::InvalidPackageName(sanitize_for_error(raw)));
         }
 
         Ok(Self(trimmed.to_string()))
@@ -49,18 +52,21 @@ pub struct PackageVersion(String);
 
 impl PackageVersion {
     pub fn parse_and_sanitize(raw: &str) -> Result<Self, DomainError> {
-        if raw.chars().any(char::is_control) {
-            return Err(DomainError::InvalidPackageVersion(raw.to_string()));
+        if raw
+            .chars()
+            .any(|ch| ch.is_control() || is_bidi_or_invisible_format(ch))
+        {
+            return Err(DomainError::InvalidPackageVersion(sanitize_for_error(raw)));
         }
 
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return Err(DomainError::InvalidPackageVersion(raw.to_string()));
+            return Err(DomainError::InvalidPackageVersion(sanitize_for_error(raw)));
         }
 
         let pre_sanitized = sanitize_colons_slashes_whitespace(trimmed);
         if pre_sanitized.is_empty() {
-            return Err(DomainError::InvalidPackageVersion(raw.to_string()));
+            return Err(DomainError::InvalidPackageVersion(sanitize_for_error(raw)));
         }
 
         if let Some((upstream, release)) = pre_sanitized.rsplit_once('-') {
@@ -72,7 +78,7 @@ impl PackageVersion {
 
         let clean_full = sanitize_pkgver_segment(&pre_sanitized);
         if clean_full.is_empty() {
-            return Err(DomainError::InvalidPackageVersion(raw.to_string()));
+            return Err(DomainError::InvalidPackageVersion(sanitize_for_error(raw)));
         }
 
         Ok(Self(format!("{clean_full}-1")))
@@ -191,16 +197,21 @@ impl ArchArchitecture {
             "armv7hl" | "armhf" => Ok(Self::Other("armv7h".to_string())),
             "armel" => Ok(Self::Other("arm".to_string())),
             "src" | "nosrc" => Err(DomainError::InvalidControlMetadata(format!(
-                "source RPM architecture '{raw}' is not installable"
+                "source RPM architecture '{}' is not installable",
+                sanitize_for_error(raw)
             ))),
             other => Self::validate_other_arch(raw, other),
         }
     }
 
     fn normalize_arch_input(raw: &str) -> Result<String, DomainError> {
-        if raw.chars().any(char::is_control) {
+        if raw
+            .chars()
+            .any(|ch| ch.is_control() || is_bidi_or_invisible_format(ch))
+        {
             return Err(DomainError::InvalidControlMetadata(format!(
-                "architecture contains control characters: '{raw}'"
+                "architecture contains control characters: '{}'",
+                sanitize_for_error(raw)
             )));
         }
         Ok(raw.trim().to_ascii_lowercase())
@@ -215,7 +226,8 @@ impl ArchArchitecture {
             Ok(Self::Other(normalized.to_string()))
         } else {
             Err(DomainError::InvalidControlMetadata(format!(
-                "invalid architecture '{raw}'"
+                "invalid architecture '{}'",
+                sanitize_for_error(raw)
             )))
         }
     }
@@ -345,6 +357,7 @@ pub struct ConvertedArchPackage {
     pub metadata: PkgInfoMetadata,
     pub payload_entry_count: usize,
     pub kept_on_disk: bool,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,13 +376,34 @@ pub struct InstallOptions {
     pub dry_run: bool,
     pub auto_confirm: bool,
     pub keep_pkg_dir: Option<PathBuf>,
+    pub allow_replace_foreign: bool,
+    pub allow_suid: bool,
+    pub max_uncompressed_bytes: u64,
+    pub staging_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Default for InstallOptions {
+    fn default() -> Self {
+        Self {
+            ignore_deps: false,
+            strict_deps: false,
+            dry_run: false,
+            auto_confirm: false,
+            keep_pkg_dir: None,
+            allow_replace_foreign: false,
+            allow_suid: false,
+            max_uncompressed_bytes: DEFAULT_MAX_UNCOMPRESSED_BYTES,
+            staging_dir: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UninstallOptions {
     pub dry_run: bool,
     pub auto_confirm: bool,
     pub keep_deps: bool,
+    pub allow_replace_foreign: bool,
 }
 
 #[cfg(test)]

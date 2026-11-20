@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::io;
 
 use crate::domain::control_parser::sanitize_single_line_value;
 use crate::domain::models::{PayloadEntryKind, PayloadEntryRecord, PkgInfoMetadata};
@@ -61,51 +62,70 @@ pub fn format_mtree(
     pkginfo_sha256: &str,
     entries: &[PayloadEntryRecord],
 ) -> String {
-    let mut out = String::with_capacity(entries.len() * 140 + 256);
-    let _ = writeln!(out, "#mtree");
-    let _ = writeln!(out, "/set type=file uid=0 gid=0 mode=644");
-    let _ = writeln!(
+    let mut out = Vec::with_capacity(entries.len() * 140 + 256);
+    let _ = write_mtree(
+        &mut out,
+        builddate,
+        pkginfo_size,
+        pkginfo_md5,
+        pkginfo_sha256,
+        entries,
+    );
+    String::from_utf8(out).unwrap_or_default()
+}
+
+pub fn write_mtree<W: io::Write>(
+    out: &mut W,
+    builddate: u64,
+    pkginfo_size: u64,
+    pkginfo_md5: &str,
+    pkginfo_sha256: &str,
+    entries: &[PayloadEntryRecord],
+) -> io::Result<()> {
+    writeln!(out, "#mtree")?;
+    writeln!(out, "/set type=file uid=0 gid=0 mode=644")?;
+    writeln!(
         out,
         "./.PKGINFO time={builddate}.0 size={pkginfo_size} md5digest={pkginfo_md5} sha256digest={pkginfo_sha256}"
-    );
+    )?;
 
     for entry in entries {
         let escaped_path = escape_mtree_token(&entry.mtree_path);
         let mode_octal = entry.mode & 0o7777;
         match &entry.kind {
             PayloadEntryKind::Directory => {
-                let _ = writeln!(
+                writeln!(
                     out,
                     "./{escaped_path} time={}.0 mode={mode_octal:o} type=dir",
                     entry.mtime_secs
-                );
+                )?;
             }
             PayloadEntryKind::Symlink { target } => {
                 let escaped_target = escape_mtree_token(target);
-                let _ = writeln!(
+                writeln!(
                     out,
                     "./{escaped_path} time={}.0 mode=777 type=link link={escaped_target}",
                     entry.mtime_secs
-                );
+                )?;
             }
             PayloadEntryKind::RegularFile | PayloadEntryKind::Hardlink { .. } => {
-                let _ = write!(
+                write!(
                     out,
                     "./{escaped_path} time={}.0 mode={mode_octal:o} size={}",
                     entry.mtime_secs, entry.size
-                );
+                )?;
                 if let Some(md5) = entry.md5_hex.as_deref() {
-                    let _ = write!(out, " md5digest={md5}");
+                    write!(out, " md5digest={md5}")?;
                 }
                 if let Some(sha256) = entry.sha256_hex.as_deref() {
-                    let _ = write!(out, " sha256digest={sha256}");
+                    write!(out, " sha256digest={sha256}")?;
                 }
-                out.push('\n');
+                out.write_all(b"\n")?;
             }
         }
     }
 
-    out
+    Ok(())
 }
 
 pub fn escape_mtree_token(input: &str) -> String {

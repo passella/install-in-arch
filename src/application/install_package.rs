@@ -10,6 +10,8 @@ use crate::domain::ports::{
     ArchPackageConverterPort, ArchPackageRepository, ClockPort, PackageConversionRequest,
     SourcePackageInspectorPort, SystemPackageManagerPort,
 };
+use crate::domain::rpm_dependency_parser::is_protected_system_package;
+use crate::domain::sanitizer::{sanitize_for_error, sanitize_terminal_text};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallPackageCommand {
@@ -58,17 +60,25 @@ impl<'a> InstallPackageUseCase<'a> {
         &self,
         command: InstallPackageCommand,
     ) -> Result<InstallPackageOutcome, DomainError> {
+        if command.options.max_uncompressed_bytes == 0 {
+            return Err(DomainError::InvalidControlMetadata(
+                "max-uncompressed-size must be greater than zero".to_string(),
+            ));
+        }
+
         let format = SourcePackageFormat::from_path(&command.source_path);
         let format_label = match &format {
-            SourcePackageFormat::Deb => "deb",
-            SourcePackageFormat::Rpm => "rpm",
+            SourcePackageFormat::Deb => "deb".to_string(),
+            SourcePackageFormat::Rpm => "rpm".to_string(),
             SourcePackageFormat::Unsupported(ext) => {
                 let label = if ext.is_empty() {
                     command.source_path.display().to_string()
                 } else {
                     ext.clone()
                 };
-                return Err(DomainError::UnsupportedPackageFormat(label));
+                return Err(DomainError::UnsupportedPackageFormat(sanitize_for_error(
+                    &label,
+                )));
             }
         };
 
@@ -77,20 +87,27 @@ impl<'a> InstallPackageUseCase<'a> {
             .iter()
             .copied()
             .find(|item| item.supports(&format))
-            .ok_or_else(|| DomainError::UnsupportedPackageFormat(format_label.to_string()))?;
+            .ok_or_else(|| DomainError::UnsupportedPackageFormat(format_label.clone()))?;
 
         let converter = self
             .converters
             .iter()
             .copied()
             .find(|item| item.supports(&format))
-            .ok_or_else(|| DomainError::UnsupportedPackageFormat(format_label.to_string()))?;
+            .ok_or(DomainError::UnsupportedPackageFormat(format_label))?;
 
         let control = inspector.read_control_metadata(&command.source_path)?;
 
         let pkg_name = PackageName::parse_and_sanitize(&control.package)?;
         let pkg_ver = PackageVersion::parse_and_sanitize(&control.version)?;
         let arch = ArchArchitecture::from_source_arch(&format, &control.architecture)?;
+
+        let mut warnings = Vec::new();
+        self.guard_foreign_package_collision(
+            &pkg_name,
+            command.options.allow_replace_foreign,
+            &mut warnings,
+        )?;
 
         let mut all_clauses = control.pre_depends.clone();
         all_clauses.extend(control.depends.iter().cloned());
@@ -103,16 +120,15 @@ impl<'a> InstallPackageUseCase<'a> {
             command.options.strict_deps,
         )?;
 
-        let mut warnings = Vec::new();
         if !control.maintainer_scripts.is_empty() {
             let script_warning = match format {
                 SourcePackageFormat::Rpm => format!(
                     "RPM scriptlets detected ({}) — skipped and NOT executed automatically.",
-                    control.maintainer_scripts.join(", ")
+                    sanitize_terminal_text(&control.maintainer_scripts.join(", "))
                 ),
                 _ => format!(
                     "Debian maintainer scripts detected ({}) — skipped and NOT executed automatically.",
-                    control.maintainer_scripts.join(", ")
+                    sanitize_terminal_text(&control.maintainer_scripts.join(", "))
                 ),
             };
             warnings.push(script_warning);
@@ -124,7 +140,7 @@ impl<'a> InstallPackageUseCase<'a> {
             };
             warnings.push(format!(
                 "Unmapped {dep_label} dependencies omitted from .PKGINFO: {}",
-                resolved.unresolved_clauses.join(", ")
+                sanitize_terminal_text(&resolved.unresolved_clauses.join(", "))
             ));
         }
 
@@ -133,16 +149,20 @@ impl<'a> InstallPackageUseCase<'a> {
             .clone()
             .unwrap_or_else(|| "custom".to_string());
 
-        let conflicts: Vec<String> = control
-            .conflicts
-            .into_iter()
-            .filter(|name| name != pkg_name.as_str())
-            .collect();
-        let replaces: Vec<String> = control
-            .obsoletes
-            .into_iter()
-            .filter(|name| name != pkg_name.as_str())
-            .collect();
+        let conflicts = self.filter_relation_targets(
+            &pkg_name,
+            control.conflicts,
+            "conflict",
+            command.options.allow_replace_foreign,
+            &mut warnings,
+        )?;
+        let replaces = self.filter_relation_targets(
+            &pkg_name,
+            control.obsoletes,
+            "replaces",
+            command.options.allow_replace_foreign,
+            &mut warnings,
+        )?;
 
         let conversion_request = PackageConversionRequest {
             source_path: command.source_path,
@@ -157,9 +177,16 @@ impl<'a> InstallPackageUseCase<'a> {
             replaces,
             build_date: self.clock.unix_timestamp_secs(),
             keep_pkg_dir: command.options.keep_pkg_dir.clone(),
+            allow_suid: command.options.allow_suid,
+            max_uncompressed_bytes: command.options.max_uncompressed_bytes,
+            staging_dir: command.options.staging_dir.clone(),
         };
 
         let staged = converter.convert_to_arch_package(&conversion_request)?;
+        for pkg_warning in &staged.package.warnings {
+            warnings.push(sanitize_terminal_text(pkg_warning));
+        }
+
         let command_preview = self
             .package_manager
             .install_command_preview(&staged.package.archive_path, command.options.auto_confirm);
@@ -187,5 +214,92 @@ impl<'a> InstallPackageUseCase<'a> {
             command_preview,
             warnings,
         })
+    }
+
+    fn guard_foreign_package_collision(
+        &self,
+        pkg_name: &PackageName,
+        allow_replace_foreign: bool,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), DomainError> {
+        if let Some(installed) = self.package_manager.installed_package_info(pkg_name)? {
+            if installed.packager != PkgInfoMetadata::DEFAULT_PACKAGER {
+                if !allow_replace_foreign {
+                    return Err(DomainError::ForeignPackageConflict {
+                        package: pkg_name.to_string(),
+                        packager: sanitize_for_error(&installed.packager),
+                    });
+                }
+                warnings.push(format!(
+                    "Replacing foreign/native installed package '{}' (packager: '{}') due to --allow-replace-foreign.",
+                    pkg_name,
+                    sanitize_terminal_text(&installed.packager)
+                ));
+            }
+            return Ok(());
+        }
+
+        if self.arch_repo.is_native_sync_package(pkg_name.as_str())? {
+            if !allow_replace_foreign {
+                return Err(DomainError::ForeignPackageConflict {
+                    package: pkg_name.to_string(),
+                    packager: "Arch sync repository package".to_string(),
+                });
+            }
+            warnings.push(format!(
+                "Package '{}' collides with an Arch sync repository package; proceeding due to --allow-replace-foreign.",
+                pkg_name
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn filter_relation_targets(
+        &self,
+        self_pkg_name: &PackageName,
+        raw_targets: Vec<String>,
+        relation_label: &str,
+        allow_replace_foreign: bool,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<String>, DomainError> {
+        let mut filtered = Vec::new();
+        for name in raw_targets {
+            if name == self_pkg_name.as_str() {
+                continue;
+            }
+            if is_protected_system_package(&name) {
+                warnings.push(format!(
+                    "Omitted protected system package '{}' from .PKGINFO {relation_label}.",
+                    sanitize_terminal_text(&name)
+                ));
+                continue;
+            }
+            let Ok(rel_pkg) = PackageName::parse_and_sanitize(&name) else {
+                continue;
+            };
+            let is_installed_foreign = self
+                .package_manager
+                .installed_package_info(&rel_pkg)?
+                .is_some_and(|info| info.packager != PkgInfoMetadata::DEFAULT_PACKAGER);
+            let is_sync_native = self.arch_repo.is_native_sync_package(rel_pkg.as_str())?;
+
+            if is_installed_foreign || is_sync_native {
+                if !allow_replace_foreign {
+                    warnings.push(format!(
+                        "Omitted foreign/native package '{}' from .PKGINFO {relation_label}; pass --allow-replace-foreign to preserve.",
+                        sanitize_terminal_text(rel_pkg.as_str())
+                    ));
+                    continue;
+                }
+                warnings.push(format!(
+                    ".PKGINFO {relation_label} references foreign/native package '{}' (--allow-replace-foreign enabled).",
+                    sanitize_terminal_text(rel_pkg.as_str())
+                ));
+            }
+
+            filtered.push(name);
+        }
+        Ok(filtered)
     }
 }

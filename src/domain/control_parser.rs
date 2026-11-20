@@ -2,23 +2,11 @@ use std::collections::HashMap;
 
 use crate::domain::error::DomainError;
 use crate::domain::models::{DependencyAlternative, DependencyClause, SourcePackageMetadata};
+use crate::domain::sanitizer::sanitize_for_error;
 
-pub fn sanitize_single_line_value(raw: &str) -> String {
-    let mut clean = String::with_capacity(raw.len());
-    let mut last_space = false;
-    for ch in raw.chars() {
-        if ch.is_control() || ch.is_whitespace() {
-            if !last_space && !clean.is_empty() {
-                clean.push(' ');
-                last_space = true;
-            }
-        } else {
-            clean.push(ch);
-            last_space = false;
-        }
-    }
-    clean.trim().to_string()
-}
+pub use crate::domain::sanitizer::sanitize_single_line_value;
+
+pub const MAX_DEPENDENCY_CLAUSES: usize = 4096;
 
 pub fn parse_control_file(
     raw: &str,
@@ -101,6 +89,13 @@ pub fn parse_dependency_list(raw: &str) -> Result<Vec<DependencyClause>, DomainE
         if trimmed_clause.is_empty() {
             continue;
         }
+        if clauses.len() >= MAX_DEPENDENCY_CLAUSES {
+            return Err(DomainError::ResourceLimitExceeded {
+                resource: "dependency clauses".to_string(),
+                limit: MAX_DEPENDENCY_CLAUSES as u64,
+                context: "parsing Debian dependencies".to_string(),
+            });
+        }
         let mut alternatives = Vec::new();
         for raw_alt in trimmed_clause.split('|') {
             let trimmed_alt = raw_alt.trim();
@@ -110,7 +105,8 @@ pub fn parse_dependency_list(raw: &str) -> Result<Vec<DependencyClause>, DomainE
             let package_name = extract_debian_package_name(trimmed_alt);
             if package_name.starts_with('-') {
                 return Err(DomainError::InvalidControlMetadata(format!(
-                    "dependency name cannot start with '-': '{package_name}'"
+                    "dependency name cannot start with '-': '{}'",
+                    sanitize_for_error(&package_name)
                 )));
             }
             if !package_name.is_empty() {
@@ -172,7 +168,8 @@ fn parse_deb822_fields(raw: &str) -> Result<HashMap<String, String>, DomainError
 
         let Some((raw_key, raw_value)) = clean_line.split_once(':') else {
             return Err(DomainError::InvalidControlMetadata(format!(
-                "malformed control line: '{clean_line}'"
+                "malformed control line: '{}'",
+                sanitize_for_error(clean_line)
             )));
         };
 

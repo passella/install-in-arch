@@ -96,6 +96,10 @@ install-in-arch [OPÇÕES] [TARGET]
 | `--keep-pkg <DIR>` | Salva o arquivo `.pkg.tar.zst` gerado dentro de `<DIR>` em vez de removê-lo com o diretório temporário após a execução. |
 | `-y`, `--yes` | Repassa `--noconfirm` ao `pacman` durante a instalação ou desinstalação. |
 | `--keep-deps` | Mantém dependências não utilizadas ao desinstalar (executa `pacman -R` em vez de `pacman -Rs`). Requer `-u`/`--uninstall`. |
+| `--allow-replace-foreign` | Permite substituir na instalação ou remover na desinstalação pacotes que não foram empacotados pelo `install-in-arch` (e honrar `Conflicts`/`Obsoletes` não protegidos). |
+| `--allow-suid` | Preserva bits `SUID`/`SGID` (`0o6000`) nos arquivos convertidos em vez de removê-los (mantém aviso em `stderr`; o bit `world-writable` continua sendo sempre removido). |
+| `--max-uncompressed-size <SIZE>` | Cota máxima de bytes descomprimidos do *payload* (suporta sufixos `K`, `M`, `G`, `KiB`, `MiB`, `GiB`, `KB`, `MB`, `GB`; padrão: `4 GiB`). |
+| `--staging-dir <DIR>` | Diretório temporário para *staging* em disco durante a conversão (padrão: `$XDG_CACHE_HOME/install-in-arch` ou diretório temporário do sistema). |
 | `-h`, `--help` | Exibe a ajuda completa da CLI. |
 | `-V`, `--version` | Exibe a versão do binário. |
 
@@ -155,9 +159,9 @@ install-in-arch -u --keep-deps -y meu-app
 
 ### 1. Streaming `.deb` / `.rpm` → `.pkg.tar.zst`
 
-1. Para `.deb`, o `DebPackageAdapter` abre o contêiner `ar` em *streaming* com buffers de 64 KiB, validando `debian-binary` (`2.x`), lendo `control.tar.*` e processando `data.tar.*`. Para `.rpm`, o `RpmPackageAdapter` lê cabeçalhos e *payload* CPIO em *streaming* via `rpm::PackageReader`, ignorando entradas `%ghost` e preservando *hardlinks* agrupados por inode sem zerar conteúdo.
-2. Durante a leitura do *payload*, o conteúdo dos arquivos regulares é gravado sequencialmente pelo `arch_pkg_writer` em um arquivo temporário de *blobs* (`NamedTempFile`) enquanto os digests **MD5** e **SHA-256** são calculados em passagem única, evitando carregar pacotes grandes inteiros na memória RAM.
-3. Ao final, os metadados `.PKGINFO` e `.MTREE` (comprimido em gzip) precedem os itens do *payload* no arquivo `.tar.zst` final (`<pkgname>-<pkgver>-<arch>.pkg.tar.zst`), com propriedade normalizada para `uid=0` / `gid=0`.
+1. Para `.deb`, o `DebPackageAdapter` utiliza um parser interno estrito da variante *Common* `ar` (`common_ar`) em *streaming* com buffers de 64 KiB, validando `debian-binary` (`2.x`), lendo `control.tar.*` e processando `data.tar.*`. Para `.rpm`, o `RpmPackageAdapter` pré-valida os cabeçalhos binários (*Lead* + *IndexHeaders*), verifica assinaturas/digests (`verify_digests()` e `SHA256`/`SHA512` do *payload*) e lê *payload* CPIO em *streaming* via `rpm::PackageReader`, ignorando entradas `%ghost` e preservando *hardlinks* agrupados por inode sem zerar conteúdo.
+2. Durante a leitura do *payload*, o conteúdo dos arquivos regulares é gravado sequencialmente pelo `arch_pkg_writer` em arquivos temporários em disco (`--staging-dir`, `$XDG_CACHE_HOME/install-in-arch` ou diretório temporário do sistema) enquanto os digests **MD5** e **SHA-256** são calculados em passagem única com contabilidade estrita (`checked_add`), evitando exaustão de `/tmp` (`tmpfs`) e memória RAM em pacotes grandes.
+3. Ao final, os metadados `.PKGINFO` e `.MTREE` (gerado em *streaming* e comprimido em gzip em arquivo temporário) precedem os itens do *payload* no arquivo `.tar.zst` final (`<pkgname>-<pkgver>-<arch>.pkg.tar.zst`), com propriedade normalizada para `uid=0` / `gid=0`. Com `--keep-pkg <DIR>`, o arquivo final é persistido de forma atômica via arquivo temporário seguro no mesmo diretório e `persist_noclobber` (sem sobrescrever destinos nem seguir *symlinks*).
 
 ### 2. Mapeamento Debian / RPM → Arch em camadas
 
@@ -170,15 +174,16 @@ install-in-arch -u --keep-deps -y meu-app
   1. **Pré-filtragem e expressões ricas (RPM):** ignora capabilities internas (`rpmlib(...)`, `rtld(...)`, `config(...)`) e cláusulas condicionais (`(... if ...)`, `(... unless ...)`), além de tratar expressões booleanas como `(a or b)` e `(a and b)`.
   2. **Tabela curada:** mapeia pacotes Debian/Fedora/RHEL, *paths* (`/bin/sh`, `/usr/bin/env`, `/usr/bin/python3`, `/usr/bin/perl`, `/sbin/ldconfig`, etc.) e *sonames* `.so` comuns (ex.: `libc.so.6` → `glibc`, `libstdc++.so.6` → `gcc-libs`, `libgtk-3.so.0` / `libgtk-3-0` → `gtk3`, `libwebkit2gtk-4.1.so.0` / `libwebkit2gtk-4.1-0` → `webkit2gtk-4.1`, `libasound.so.2` / `libasound2` → `alsa-lib`, `libssl.so.3` / `libssl3` → `openssl`, entre dezenas de outros).
   3. **Heurística automática e *virtual provides* `.so`:** remove sufixos `t64`, `-libs`, versões de ABI numéricas e testa variações com/sem prefixo `lib`, além de consultar *virtual provides* `.so` diretamente no `pacman` (ex.: `libfoo.so`).
-  4. **Validação real no `pacman`:** cada candidato (incluindo alternativas `a | b` ou `(a or b)`) é verificado contra pacotes instalados (`pacman -Qq`), bancos de sincronização (`pacman -Slq`), metadados remotos (`pacman -Si`) e pacotes virtuais (`pacman -Sddp`), com cache em memória por execução. Dependências não mapeadas são omitidas com aviso em `stderr` (ou abortam o processo com `--strict-deps`).
+  4. **Validação real em lote no `pacman`:** os bancos local (`pacman -Qq`), de sincronização (`pacman -Slq`), metadados (`pacman -Qi` / `pacman -Si`) e *virtual provides* `.so` são consultados com resolução em lote e cache em memória por execução, evitando amplificação de subprocessos. Dependências não mapeadas são omitidas com aviso em `stderr` (ou abortam o processo com `--strict-deps`).
 
-### 3. Normalização *usr-merge*
+### 3. Normalização *usr-merge* e consistência de árvore
 
-No Arch Linux, `/bin`, `/sbin`, `/lib`, `/lib64`, `/usr/sbin` e `/usr/lib64` são *symlinks* para `/usr/bin` ou `/usr/lib`. Instalar entradas diretamente nesses caminhos quebraria a extração do `pacman`. O `path_normalizer` resolve isso automaticamente:
+No Arch Linux, `/bin`, `/sbin`, `/lib`, `/lib64`, `/usr/sbin`, `/usr/lib64`, `/var/run` e `/var/lock` são *symlinks*. Instalar entradas diretamente nesses caminhos quebraria a extração do `pacman`. O `path_normalizer` e o `arch_pkg_writer` resolvem isso automaticamente:
 
 - `bin/*`, `sbin/*`, `usr/sbin/*` → `usr/bin/*`
 - `lib/*`, `lib64/*`, `usr/lib64/*` → `usr/lib/*`
-- Cria entradas de diretório pai (`usr`, `usr/bin`, `usr/lib`) quando necessário, descarta symlinks autorreferenciais e recalcula alvos de *symlinks* relativos/absolutos e *hardlinks* para que continuem válidos após o remapeamento.
+- `var/run/*` → `run/*` e `var/lock/*` → `run/lock/*`
+- Validação estrutural pai-filho: cria entradas de diretório pai quando necessário, rejeita entradas onde um diretório ancestral foi declarado como *symlink* ou arquivo regular, bloqueia conflitos entre tipos (`Directory` vs `RegularFile`), descarta symlinks autorreferenciais e recalcula alvos de *symlinks* e *hardlinks*.
 
 ### 4. Integridade `.MTREE` v2 compatível com `pacman -Qkk`
 
@@ -190,10 +195,13 @@ O gerador produz um `.MTREE` v2 (`#mtree` + `/set type=file uid=0 gid=0 mode=644
 
 ### 5. Endurecimento de segurança
 
-- **Proteção contra *Path Traversal*:** qualquer caminho de arquivo ou *hardlink* contendo componente `..` é rejeitado (`UnsafePathTraversal`).
-- **Bloqueio de arquivos reservados do `pacman`:** entradas na raiz do payload chamadas `.PKGINFO`, `.MTREE`, `.BUILDINFO`, `.INSTALL` ou `.CHANGELOG` são rejeitadas (`ReservedPackageMetadataPath`).
+- **Proteção de pacotes instalados e do sistema:** por padrão bloqueia a substituição ou desinstalação de pacotes cujo `Packager` não corresponda exatamente a `install-in-arch <install-in-arch@local>` ou que existam nos repositórios nativos do `pacman` (exigindo `--allow-replace-foreign`). Em RPMs, `Conflicts` e `Obsoletes` contra pacotes críticos do sistema (`glibc`, `pacman`, `systemd`, `bash`, kernel, etc.) são sempre filtrados com aviso em `stderr`, e conflitos contra pacotes de terceiros/nativos exigem `--allow-replace-foreign`.
+- **Sanitização de permissões (`SUID`/`SGID` e `world-writable`):** o bit `world-writable` (`0o0002`) é sempre removido de arquivos regulares e diretórios não *sticky*. Os bits `SUID`/`SGID` (`0o6000`) são removidos por padrão com aviso em `stderr`, podendo ser preservados apenas de forma explícita com `--allow-suid` (mantendo o aviso).
+- **Integridade na fronteira privilegiada e execução segura:** detecção de privilégios via syscall (`rustix::process::geteuid()`) sem subprocessos `id`, invocação exclusiva de caminhos absolutos confiáveis (`/usr/bin/pacman`, `/usr/bin/sudo`) com verificação de propriedade `root` e permissões seguras, e escrita atômica sem *clobber* nem *symlinks* em `--keep-pkg` / `--staging-dir`.
+- **Hardening contra DoS e malformação nos parsers:** parser *Common* `ar` próprio sem extensões GNU nem alocações guiadas por cabeçalhos; pré-validação de *headers* e limites em RPMs antes do parse completo; decodificação `XZ` limitada a 256 MiB de dicionário; proteção em entradas estendidas `tar` (`L`/`K`/`PAX` limitados a 1 MiB, rejeição de *GNU sparse*); teto `--max-uncompressed-size` (padrão `4 GiB`) e `MAX_STAGED_ENTRIES`.
+- **Proteção contra *Path Traversal*, *dotfiles* e UTF-8 inválido:** rejeição de `..`, bytes `NUL`, caracteres BiDi/controle em caminhos, *dotfiles* arbitrários na raiz (além de `.PKGINFO`, `.MTREE`, `.BUILDINFO`, `.INSTALL`, `.CHANGELOG`), e caminhos/alvos não UTF-8 (sem substituição `lossy`).
 - **Scripts de mantenedor não executados:** `preinst`, `postinst`, `prerm` e `postrm` (no `.deb`) bem como *scriptlets* RPM (`prein`, `postin`, `preun`, `postun`, `pretrans`, `posttrans`, etc.) **não são executados nem convertidos em `.INSTALL`**; o usuário recebe um aviso explícito em `stderr`.
-- **Sanitização de metadados e argumentos:** campos textuais do `.PKGINFO` são sanitizados em linha única para impedir injeção de diretivas; nomes de pacotes e dependências iniciados com `-` são bloqueados; todas as invocações ao `pacman` usam o separador `--` antes de caminhos de arquivo ou nomes de pacote.
+- **Sanitização de metadados, argumentos e terminal:** sequências de controle ANSI (`CSI`/`OSC`/C1) e caracteres direcionais BiDi são removidos ou escapados em `--list`, avisos e `DomainError`; nomes e dependências iniciados com `-` são bloqueados; todas as invocações ao `pacman` usam separador `--`.
 
 ---
 
@@ -214,7 +222,8 @@ src/
 │   ├── rpm_dependency_parser.rs         # Parser de Requires/Conflicts/Obsoletes RPM e expressões ricas
 │   ├── dependency_resolver.rs           # Resolução curada + heurística (.deb e .rpm) contra ArchPackageRepository
 │   ├── path_normalizer.rs               # Validação de segurança, usr-merge e ajuste de symlinks/hardlinks
-│   └── pkg_formatter.rs                 # Formatação de .PKGINFO e .MTREE v2
+│   ├── pkg_formatter.rs                 # Formatação de .PKGINFO e streaming .MTREE v2
+│   └── sanitizer.rs                     # Sanitização ANSI/BiDi/linha única e proteção de erros
 ├── application/                         # Casos de uso (orquestração de domínio)
 │   ├── mod.rs
 │   ├── install_package.rs               # InstallPackageUseCase
@@ -227,24 +236,36 @@ src/
     │   └── cli.rs                       # CliArgs (clap) e CliDispatcher
     └── outbound/                        # Driven Adapters
         ├── mod.rs
-        ├── arch_pkg_writer.rs           # Motor compartilhado de staging, usr-merge, .MTREE v2 e .pkg.tar.zst
-        ├── deb_package_adapter.rs       # Streaming .deb -> ArchPackageStager (ar, tar, gz/xz/zst/bz2)
-        ├── rpm_package_adapter.rs       # Streaming .rpm -> ArchPackageStager (rpm, CPIO, %ghost, hardlinks)
+        ├── arch_pkg_writer.rs           # Motor compartilhado de staging em disco, permissões, árvore e .pkg.tar.zst
+        ├── common_ar.rs                 # Parser interno estrito da variante Common ar
+        ├── deb_package_adapter.rs       # Streaming .deb -> ArchPackageStager (ar, tar guard, gz/xz/zst/bz2)
+        ├── rpm_package_adapter.rs       # Streaming .rpm -> ArchPackageStager (pré-validação, digests, CPIO)
         ├── multi_format_adapter.rs      # Despacho unificado por SourcePackageFormat (.deb / .rpm)
-        ├── pacman_adapter.rs            # Integração segura com pacman + cache de consultas
-        └── system_process.rs            # SystemCommandRunner, SystemPrivilegeDetector, SystemClock
+        ├── pacman_adapter.rs            # Integração segura com /usr/bin/pacman e cache em lote
+        └── system_process.rs            # SystemCommandRunner (caminhos absolutos), geteuid() e SystemClock
 ```
 
 ---
 
 ## Desenvolvimento e Testes
 
-A suíte conta com testes unitários nos módulos de domínio/adaptadores, testes de componente dos casos de uso ([`tests/use_case_component_tests.rs`](tests/use_case_component_tests.rs)), testes de integração de conversão `.deb` ([`tests/deb_conversion_integration_tests.rs`](tests/deb_conversion_integration_tests.rs)) e testes de integração/adversariais de conversão `.rpm` ([`tests/rpm_conversion_integration_tests.rs`](tests/rpm_conversion_integration_tests.rs)).
+A suíte conta com testes unitários nos módulos de domínio/adaptadores, testes de componente dos casos de uso ([`tests/use_case_component_tests.rs`](tests/use_case_component_tests.rs)), testes de integração/adversariais de conversão `.deb` ([`tests/deb_conversion_integration_tests.rs`](tests/deb_conversion_integration_tests.rs)), testes de integração/adversariais de conversão `.rpm` ([`tests/rpm_conversion_integration_tests.rs`](tests/rpm_conversion_integration_tests.rs)) e alvos de fuzzing (`cargo-fuzz`) em [`fuzz/`](fuzz/Cargo.toml) (`deb_ar_parser`, `rpm_header_parser`, `control_parser`, `rpm_dependency_parser` e `path_normalizer`).
 
 Execute as verificações de formatação, lint estrito e testes com:
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo test
+cargo test --locked
+```
+
+Para executar os *fuzzers* (requer `cargo-fuzz` e toolchain Rust nightly):
+
+```bash
+cd fuzz
+cargo fuzz run deb_ar_parser
+cargo fuzz run rpm_header_parser
+cargo fuzz run control_parser
+cargo fuzz run rpm_dependency_parser
+cargo fuzz run path_normalizer
 ```

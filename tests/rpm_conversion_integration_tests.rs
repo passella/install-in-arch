@@ -29,7 +29,8 @@ use install_in_arch::application::uninstall_package::{
 };
 use install_in_arch::domain::error::DomainError;
 use install_in_arch::domain::models::{
-    InstallOptions, InstalledPackageSummary, PackageName, SourcePackageFormat, UninstallOptions,
+    InstallOptions, InstalledPackageSummary, PackageName, PkgInfoMetadata, SourcePackageFormat,
+    UninstallOptions,
 };
 use install_in_arch::domain::path_normalizer::is_conflicting_arch_path;
 use install_in_arch::domain::ports::{
@@ -51,6 +52,10 @@ impl ArchPackageRepository for FakeRepo {
     fn package_exists(&self, package_name: &str) -> Result<bool, DomainError> {
         Ok(self.0.contains(package_name))
     }
+
+    fn is_native_sync_package(&self, package_name: &str) -> Result<bool, DomainError> {
+        Ok(self.0.contains(package_name))
+    }
 }
 
 struct RecordingPackageManager {
@@ -60,6 +65,23 @@ struct RecordingPackageManager {
 impl SystemPackageManagerPort for RecordingPackageManager {
     fn is_installed(&self, package_name: &PackageName) -> Result<bool, DomainError> {
         Ok(self.installed.contains(package_name.as_str()))
+    }
+
+    fn installed_package_info(
+        &self,
+        package_name: &PackageName,
+    ) -> Result<Option<InstalledPackageSummary>, DomainError> {
+        if self.installed.contains(package_name.as_str()) {
+            Ok(Some(InstalledPackageSummary {
+                name: package_name.to_string(),
+                version: "1.0-1".to_string(),
+                architecture: "x86_64".to_string(),
+                description: "Installed test RPM".to_string(),
+                packager: PkgInfoMetadata::DEFAULT_PACKAGER.to_string(),
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     fn install_local_package(
@@ -89,11 +111,14 @@ impl SystemPackageManagerPort for RecordingPackageManager {
     fn install_command_preview(&self, package_archive: &Path, auto_confirm: bool) -> String {
         if auto_confirm {
             format!(
-                "sudo pacman -U --noconfirm -- {}",
+                "/usr/bin/sudo /usr/bin/pacman -U --noconfirm -- {}",
                 package_archive.display()
             )
         } else {
-            format!("sudo pacman -U -- {}", package_archive.display())
+            format!(
+                "/usr/bin/sudo /usr/bin/pacman -U -- {}",
+                package_archive.display()
+            )
         }
     }
 
@@ -105,9 +130,9 @@ impl SystemPackageManagerPort for RecordingPackageManager {
     ) -> String {
         let flag = if keep_deps { "-R" } else { "-Rs" };
         if auto_confirm {
-            format!("sudo pacman {flag} --noconfirm -- {package_name}")
+            format!("/usr/bin/sudo /usr/bin/pacman {flag} --noconfirm -- {package_name}")
         } else {
-            format!("sudo pacman {flag} -- {package_name}")
+            format!("/usr/bin/sudo /usr/bin/pacman {flag} -- {package_name}")
         }
     }
 }
@@ -157,10 +182,8 @@ fn missing_and_corrupt_rpm_archives_fail_cleanly() -> Result<(), Box<dyn std::er
         source_path: valid_rpm_path,
         options: InstallOptions {
             ignore_deps: true,
-            strict_deps: false,
             dry_run: true,
-            auto_confirm: false,
-            keep_pkg_dir: None,
+            ..InstallOptions::default()
         },
     });
     assert!(matches!(err, Err(DomainError::InvalidRpmArchive { .. })));
@@ -205,10 +228,8 @@ fn rejects_reserved_pacman_metadata_path_traversal_unsafe_arch_and_hyphen_deps_i
             source_path: rpm_path,
             options: InstallOptions {
                 ignore_deps: true,
-                strict_deps: false,
                 dry_run: true,
-                auto_confirm: false,
-                keep_pkg_dir: None,
+                ..InstallOptions::default()
             },
         });
         assert!(matches!(
@@ -230,10 +251,8 @@ fn rejects_reserved_pacman_metadata_path_traversal_unsafe_arch_and_hyphen_deps_i
         source_path: traversal_rpm,
         options: InstallOptions {
             ignore_deps: true,
-            strict_deps: false,
             dry_run: true,
-            auto_confirm: false,
-            keep_pkg_dir: None,
+            ..InstallOptions::default()
         },
     });
     assert!(matches!(trav_err, Err(DomainError::UnsafePathTraversal(_))));
@@ -252,10 +271,8 @@ fn rejects_reserved_pacman_metadata_path_traversal_unsafe_arch_and_hyphen_deps_i
             source_path: rpm_path,
             options: InstallOptions {
                 ignore_deps: true,
-                strict_deps: false,
                 dry_run: true,
-                auto_confirm: false,
-                keep_pkg_dir: None,
+                ..InstallOptions::default()
             },
         });
         assert!(matches!(err, Err(DomainError::InvalidControlMetadata(_))));
@@ -282,20 +299,19 @@ fn rejects_reserved_pacman_metadata_path_traversal_unsafe_arch_and_hyphen_deps_i
     let ver_header = Header::from_entries(ver_entries, IndexTag::RPMTAG_HEADERIMMUTABLE);
     let mut ver_metadata = base_ver_pkg.metadata;
     ver_metadata.header = ver_header;
-    let forged_ver_pkg = Package {
+    let mut forged_ver_pkg = Package {
         metadata: ver_metadata,
         payload: base_ver_pkg.payload,
     };
+    forged_ver_pkg.clear_signatures()?;
     forged_ver_pkg.write_file(&ansi_ver_rpm)?;
 
     let ver_err = uc.execute(InstallPackageCommand {
         source_path: ansi_ver_rpm,
         options: InstallOptions {
             ignore_deps: true,
-            strict_deps: false,
             dry_run: true,
-            auto_confirm: false,
-            keep_pkg_dir: None,
+            ..InstallOptions::default()
         },
     });
     assert!(matches!(
@@ -327,11 +343,8 @@ fn rejects_reserved_pacman_metadata_path_traversal_unsafe_arch_and_hyphen_deps_i
         let err = uc.execute(InstallPackageCommand {
             source_path: rpm_path,
             options: InstallOptions {
-                ignore_deps: false,
-                strict_deps: false,
                 dry_run: true,
-                auto_confirm: false,
-                keep_pkg_dir: None,
+                ..InstallOptions::default()
             },
         });
         assert!(
@@ -406,10 +419,9 @@ fn supports_all_rpm_compressions_architectures_and_release_formats()
             source_path: rpm_path,
             options: InstallOptions {
                 ignore_deps: true,
-                strict_deps: false,
                 dry_run: true,
-                auto_confirm: false,
                 keep_pkg_dir: Some(out_dir),
+                ..InstallOptions::default()
             },
         })?;
 
@@ -421,11 +433,12 @@ fn supports_all_rpm_compressions_architectures_and_release_formats()
             .ok_or(PathBuf::from("missing").display().to_string())?;
         assert!(kept.exists());
 
-        if let Ok(output) = Command::new("pacman")
-            .arg("-Qpi")
-            .arg(&kept)
-            .env("LC_ALL", "C")
-            .output()
+        if Path::new("/usr/bin/pacman").exists()
+            && let Ok(output) = Command::new("/usr/bin/pacman")
+                .arg("-Qpi")
+                .arg(&kept)
+                .env("LC_ALL", "C")
+                .output()
         {
             assert!(
                 output.status.success(),
@@ -585,11 +598,9 @@ fn converts_complex_rpm_with_usr_merge_hardlinks_ghosts_scriptlets_deps_and_vali
     let outcome = uc.execute(InstallPackageCommand {
         source_path: rpm_path.clone(),
         options: InstallOptions {
-            ignore_deps: false,
-            strict_deps: false,
             dry_run: true,
-            auto_confirm: false,
             keep_pkg_dir: Some(keep_dir),
+            ..InstallOptions::default()
         },
     })?;
 
@@ -607,9 +618,10 @@ fn converts_complex_rpm_with_usr_merge_hardlinks_ghosts_scriptlets_deps_and_vali
             "preun"
         ]
     );
-    assert_eq!(outcome.warnings.len(), 2);
+    assert_eq!(outcome.warnings.len(), 3);
     assert!(outcome.warnings[0].contains("RPM scriptlets detected"));
     assert!(outcome.warnings[1].contains("unmapped-fedora-extra"));
+    assert!(outcome.warnings[2].contains("Stripped SUID/SGID"));
     assert_eq!(outcome.metadata.conflicts, vec!["bad-conflict"]);
     assert_eq!(outcome.metadata.replaces, vec!["old-launcher"]);
 
@@ -688,7 +700,7 @@ fn converts_complex_rpm_with_usr_merge_hardlinks_ghosts_scriptlets_deps_and_vali
     assert_eq!(entry_modes.get("usr/bin/epic-cli"), Some(&0o755));
     assert_eq!(
         entry_modes.get("opt/Epic Games/chrome-sandbox"),
-        Some(&0o4755)
+        Some(&0o755)
     );
     assert_eq!(entry_modes.get("usr/bin/epic-admin"), Some(&0o750));
     assert_eq!(
@@ -742,7 +754,7 @@ fn converts_complex_rpm_with_usr_merge_hardlinks_ghosts_scriptlets_deps_and_vali
         "./usr/bin/epic-cli-hardlink time=1700000200.0 mode=755 size={} md5digest={expected_cli_md5} sha256digest={expected_cli_sha}\n",
         binary_payload.len(),
     )));
-    assert!(mtree_text.contains("./opt/Epic\\040Games/chrome-sandbox time=1700000200.0 mode=4755"));
+    assert!(mtree_text.contains("./opt/Epic\\040Games/chrome-sandbox time=1700000200.0 mode=755"));
     assert!(mtree_text.contains("./opt/Epic\\040Games/conf\\040\\0431\\075val.cfg"));
     assert!(mtree_text.contains(
         "./usr/bin/epic\\040launcher time=1700000200.0 mode=777 type=link link=../../opt/Epic\\040Games/chrome-sandbox"
@@ -753,8 +765,7 @@ fn converts_complex_rpm_with_usr_merge_hardlinks_ghosts_scriptlets_deps_and_vali
         target: rpm_path.to_string_lossy().into_owned(),
         options: UninstallOptions {
             dry_run: true,
-            auto_confirm: false,
-            keep_deps: false,
+            ..UninstallOptions::default()
         },
     })?;
     assert_eq!(uninstall_out.package_name.as_str(), "epicgameslauncher");
@@ -767,6 +778,7 @@ fn converts_complex_rpm_with_usr_merge_hardlinks_ghosts_scriptlets_deps_and_vali
         &rpm_path.to_string_lossy(),
         "--dry-run",
         "--ignore-deps",
+        "--allow-suid",
         "-y",
     ])?;
     dispatcher.dispatch(args, &mut cli_out, &mut cli_err)?;
@@ -775,12 +787,14 @@ fn converts_complex_rpm_with_usr_merge_hardlinks_ghosts_scriptlets_deps_and_vali
     assert!(stdout_str.contains("Package: epicgameslauncher 2.3.4-2 (x86_64)"));
     assert!(stdout_str.contains("[dry-run] Would run:"));
     assert!(stderr_str.contains("RPM scriptlets detected"));
+    assert!(stderr_str.contains("Preserving SUID/SGID"));
 
-    if let Ok(output) = Command::new("pacman")
-        .arg("-Qpi")
-        .arg(&pkg_path)
-        .env("LC_ALL", "C")
-        .output()
+    if Path::new("/usr/bin/pacman").exists()
+        && let Ok(output) = Command::new("/usr/bin/pacman")
+            .arg("-Qpi")
+            .arg(&pkg_path)
+            .env("LC_ALL", "C")
+            .output()
     {
         assert!(
             output.status.success(),
@@ -796,11 +810,12 @@ fn converts_complex_rpm_with_usr_merge_hardlinks_ghosts_scriptlets_deps_and_vali
         assert!(qpi.contains("Replaces        : old-launcher"));
     }
 
-    if let Ok(output) = Command::new("pacman")
-        .arg("-Qpl")
-        .arg(&pkg_path)
-        .env("LC_ALL", "C")
-        .output()
+    if Path::new("/usr/bin/pacman").exists()
+        && let Ok(output) = Command::new("/usr/bin/pacman")
+            .arg("-Qpl")
+            .arg(&pkg_path)
+            .env("LC_ALL", "C")
+            .output()
     {
         assert!(
             output.status.success(),
@@ -863,7 +878,11 @@ fn validates_rpm_dependency_resolution_against_readonly_host_pacman_repository()
     let privs = SystemPrivilegeDetector;
     let runner = SystemCommandRunner;
     let pacman_repo = PacmanAdapter::new(&runner, &privs);
-    let has_pacman = Command::new("pacman").arg("--version").output().is_ok();
+    let has_pacman = Path::new("/usr/bin/pacman").exists()
+        && Command::new("/usr/bin/pacman")
+            .arg("--version")
+            .output()
+            .is_ok();
     let fallback_repo = FakeRepo(
         ["glibc", "curl", "sh", "gtk3"]
             .into_iter()
@@ -887,11 +906,10 @@ fn validates_rpm_dependency_resolution_against_readonly_host_pacman_repository()
     let outcome = uc.execute(InstallPackageCommand {
         source_path: rpm_path,
         options: InstallOptions {
-            ignore_deps: false,
             strict_deps: true,
             dry_run: true,
-            auto_confirm: false,
             keep_pkg_dir: Some(out_dir),
+            ..InstallOptions::default()
         },
     })?;
 
@@ -942,10 +960,9 @@ fn validates_rpm_streaming_performance_and_rejects_source_rpm()
         source_path: rpm_path,
         options: InstallOptions {
             ignore_deps: true,
-            strict_deps: false,
             dry_run: true,
-            auto_confirm: false,
             keep_pkg_dir: Some(out_dir),
+            ..InstallOptions::default()
         },
     })?;
     let elapsed = start.elapsed();
@@ -975,26 +992,261 @@ fn validates_rpm_streaming_performance_and_rejects_source_rpm()
     let src_header = Header::from_entries(entries, IndexTag::RPMTAG_HEADERIMMUTABLE);
     let mut src_metadata = base_pkg.metadata;
     src_metadata.header = src_header;
-    let src_pkg = Package {
+    let mut src_pkg = Package {
         metadata: src_metadata,
         payload: base_pkg.payload,
     };
+    src_pkg.clear_signatures()?;
     src_pkg.write_file(&src_rpm_path)?;
 
     let src_err = uc.execute(InstallPackageCommand {
         source_path: src_rpm_path,
         options: InstallOptions {
             ignore_deps: true,
-            strict_deps: false,
             dry_run: true,
-            auto_confirm: false,
-            keep_pkg_dir: None,
+            ..InstallOptions::default()
         },
     });
     assert!(matches!(
         src_err,
         Err(DomainError::InvalidRpmArchive { .. })
     ));
+
+    Ok(())
+}
+
+#[test]
+fn rejects_tampered_rpm_digests_and_filters_critical_system_conflicts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let adapter = MultiFormatPackageAdapter::new();
+    let repo = FakeRepo(
+        ["bash", "pacman", "systemd", "glibc"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect(),
+    );
+    let pm = RecordingPackageManager {
+        installed: HashSet::new(),
+    };
+    let clock = FixedClock(1_700_000_000);
+    let inspectors: [&dyn SourcePackageInspectorPort; 1] = [&adapter];
+    let converters: [&dyn ArchPackageConverterPort; 1] = [&adapter];
+    let uc = InstallPackageUseCase::new(&inspectors, &converters, &repo, &pm, &clock);
+
+    let tampered_header_rpm = dir.path().join("tampered_header.rpm");
+    let pkg = PackageBuilder::new("good-rpm", "1.0.0", "MIT", "x86_64", "Original summary")
+        .with_file_contents(b"ok".as_slice(), FileOptions::new("/usr/bin/good-rpm"))?
+        .build()?;
+    let mut tampered_entries = Vec::new();
+    for (tag, data) in pkg.metadata.header.get_all_entries()? {
+        if tag == IndexTag::RPMTAG_HEADERIMMUTABLE as u32 {
+            continue;
+        }
+        if tag == IndexTag::RPMTAG_NAME as u32 {
+            tampered_entries.push(HeaderEntry::new(
+                tag,
+                IndexData::StringTag("bash".to_string()),
+            ));
+        } else {
+            tampered_entries.push(HeaderEntry::new(tag, data));
+        }
+    }
+    let tampered_header = Header::from_entries(tampered_entries, IndexTag::RPMTAG_HEADERIMMUTABLE);
+    let mut tampered_meta = pkg.metadata.clone();
+    tampered_meta.header = tampered_header;
+    let tampered_pkg = Package {
+        metadata: tampered_meta,
+        payload: pkg.payload.clone(),
+    };
+    tampered_pkg.write_file(&tampered_header_rpm)?;
+    assert!(matches!(
+        adapter.read_control_metadata(&tampered_header_rpm),
+        Err(DomainError::InvalidRpmArchive { .. })
+    ));
+
+    let tampered_payload_rpm = dir.path().join("tampered_payload.rpm");
+    let mut full_bytes = Vec::new();
+    pkg.write(&mut full_bytes)?;
+    if let Some(last) = full_bytes.last_mut() {
+        *last ^= 0xFF;
+    }
+    fs::write(&tampered_payload_rpm, &full_bytes)?;
+    assert!(matches!(
+        uc.execute(InstallPackageCommand {
+            source_path: tampered_payload_rpm,
+            options: InstallOptions {
+                ignore_deps: true,
+                dry_run: true,
+                ..InstallOptions::default()
+            },
+        }),
+        Err(DomainError::InvalidRpmArchive { .. })
+    ));
+
+    let conflict_rpm = dir.path().join("conflict_rpm.rpm");
+    let conflict_pkg = PackageBuilder::new("safe-app", "1.0.0", "MIT", "x86_64", "Conflicts test")
+        .conflicts(Dependency::any("bash"))
+        .conflicts(Dependency::any("pacman"))
+        .obsoletes(Dependency::any("systemd"))
+        .obsoletes(Dependency::any("glibc"))
+        .conflicts(Dependency::any("non-system-conflict"))
+        .with_file_contents(b"ok".as_slice(), FileOptions::new("/usr/bin/safe-app"))?
+        .with_file_contents(b"pid".as_slice(), FileOptions::new("/var/run/safe-app.pid"))?
+        .build()?;
+    conflict_pkg.write_file(&conflict_rpm)?;
+
+    let out_dir = dir.path().join("conflict_out");
+    let outcome = uc.execute(InstallPackageCommand {
+        source_path: conflict_rpm,
+        options: InstallOptions {
+            ignore_deps: true,
+            dry_run: true,
+            keep_pkg_dir: Some(out_dir),
+            ..InstallOptions::default()
+        },
+    })?;
+    assert_eq!(outcome.metadata.conflicts, vec!["non-system-conflict"]);
+    assert!(outcome.metadata.replaces.is_empty());
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.contains("protected system package 'bash'"))
+    );
+
+    let pkg_path = outcome
+        .kept_package_path
+        .ok_or("missing conflict_out pkg")?;
+    let mut pkg_tar = Archive::new(ZstdDecoder::new(File::open(&pkg_path)?)?);
+    let mut found_run_pid = false;
+    for entry_res in pkg_tar.entries()? {
+        let entry = entry_res?;
+        if entry.path()?.to_string_lossy() == "run/safe-app.pid" {
+            found_run_pid = true;
+        }
+    }
+    assert!(found_run_pid);
+
+    Ok(())
+}
+
+#[test]
+fn enforces_rpm_payload_uncompressed_quota_and_prevalidation_bounds()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let adapter = MultiFormatPackageAdapter::new();
+    let repo = FakeRepo(HashSet::new());
+    let pm = RecordingPackageManager {
+        installed: HashSet::new(),
+    };
+    let clock = FixedClock(1_700_000_000);
+    let inspectors: [&dyn SourcePackageInspectorPort; 1] = [&adapter];
+    let converters: [&dyn ArchPackageConverterPort; 1] = [&adapter];
+    let uc = InstallPackageUseCase::new(&inspectors, &converters, &repo, &pm, &clock);
+
+    let bomb_rpm = dir.path().join("quota_bomb.rpm");
+    let pkg = PackageBuilder::new("rpm-bomb", "1.0.0", "MIT", "x86_64", "Quota test")
+        .using_config(BuildConfig::v4().compression(CompressionType::Xz))
+        .with_file_contents(
+            vec![0x55u8; 64 * 1024],
+            FileOptions::new("/opt/app/big.bin").permissions(0o644),
+        )?
+        .build()?;
+    pkg.write_file(&bomb_rpm)?;
+
+    let err = uc.execute(InstallPackageCommand {
+        source_path: bomb_rpm,
+        options: InstallOptions {
+            ignore_deps: true,
+            dry_run: true,
+            max_uncompressed_bytes: 16 * 1024,
+            ..InstallOptions::default()
+        },
+    });
+    assert!(matches!(
+        err,
+        Err(DomainError::ResourceLimitExceeded { .. })
+    ));
+
+    let cpio_oom_rpm = dir.path().join("cpio_namesize_ffffffff.rpm");
+    let mut malformed_cpio = Vec::new();
+    malformed_cpio.extend_from_slice(b"070701");
+    malformed_cpio.extend_from_slice(b"00000001");
+    malformed_cpio.extend_from_slice(b"000081a4");
+    malformed_cpio.extend_from_slice(b"00000000");
+    malformed_cpio.extend_from_slice(b"00000000");
+    malformed_cpio.extend_from_slice(b"00000001");
+    malformed_cpio.extend_from_slice(b"00000000");
+    malformed_cpio.extend_from_slice(b"00000004");
+    malformed_cpio.extend_from_slice(b"00000000");
+    malformed_cpio.extend_from_slice(b"00000000");
+    malformed_cpio.extend_from_slice(b"00000000");
+    malformed_cpio.extend_from_slice(b"00000000");
+    malformed_cpio.extend_from_slice(b"ffffffff");
+    malformed_cpio.extend_from_slice(b"00000000");
+    malformed_cpio.extend_from_slice(b"./usr/bin/ok\0\0\0\0");
+    malformed_cpio.extend_from_slice(b"body");
+    malformed_cpio.extend_from_slice(b"07070100000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000b00000000");
+    malformed_cpio.extend_from_slice(b"TRAILER!!!\0\0\0\0");
+    let cpio_sha = hex::encode(Sha256::digest(&malformed_cpio));
+
+    let base_uncompressed = PackageBuilder::new(
+        "cpio-oom",
+        "1.0.0",
+        "MIT",
+        "x86_64",
+        "Adversarial CPIO namesize test",
+    )
+    .using_config(BuildConfig::v4().compression(CompressionType::None))
+    .with_file_contents(
+        b"body".as_slice(),
+        FileOptions::new("/usr/bin/ok").permissions(0o755),
+    )?
+    .build()?;
+    let mut cpio_entries = Vec::new();
+    for (tag, data) in base_uncompressed.metadata.header.get_all_entries()? {
+        if tag == IndexTag::RPMTAG_HEADERIMMUTABLE as u32 {
+            continue;
+        }
+        if tag == IndexTag::RPMTAG_PAYLOADSHA256 as u32
+            || tag == IndexTag::RPMTAG_PAYLOADSHA256ALT as u32
+        {
+            let replacement = match data {
+                IndexData::StringTag(_) => IndexData::StringTag(cpio_sha.clone()),
+                _ => IndexData::StringArray(vec![cpio_sha.clone()]),
+            };
+            cpio_entries.push(HeaderEntry::new(tag, replacement));
+        } else {
+            cpio_entries.push(HeaderEntry::new(tag, data));
+        }
+    }
+    let mut forged_meta = base_uncompressed.metadata;
+    forged_meta.header = Header::from_entries(cpio_entries, IndexTag::RPMTAG_HEADERIMMUTABLE);
+    let mut forged_pkg = Package {
+        metadata: forged_meta,
+        payload: malformed_cpio,
+    };
+    forged_pkg.clear_signatures()?;
+    forged_pkg.write_file(&cpio_oom_rpm)?;
+
+    let cpio_err = uc.execute(InstallPackageCommand {
+        source_path: cpio_oom_rpm,
+        options: InstallOptions {
+            ignore_deps: true,
+            dry_run: true,
+            ..InstallOptions::default()
+        },
+    });
+    match cpio_err {
+        Err(DomainError::InvalidRpmArchive { reason, .. }) => {
+            assert!(
+                reason.contains("namesize") && reason.contains("4096"),
+                "expected CPIO namesize guard rejection, got: {reason}"
+            );
+        }
+        other => return Err(format!("expected InvalidRpmArchive, got {other:?}").into()),
+    }
 
     Ok(())
 }

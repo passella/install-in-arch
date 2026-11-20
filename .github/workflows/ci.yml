@@ -1,6 +1,9 @@
 name: CI
 
 on:
+  push:
+    branches:
+      - master
   pull_request:
     branches:
       - master
@@ -13,12 +16,12 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check-and-test:
     name: Format, Clippy & Unit/Integration Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
@@ -45,7 +48,7 @@ jobs:
 
   archlinux-smoke:
     name: Arch Linux Real Pacman Smoke & Integration Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     container: archlinux@sha256:d4594bb2300cba11f41c2f27923eb56f63d9988909c402f9c95517d1e362c899
 
     steps:
@@ -75,8 +78,8 @@ jobs:
           ./target/release/install-in-arch --help
 
   security-audit:
-    name: Security Audit (RustSec)
-    runs-on: ubuntu-latest
+    name: Security & Dependency Policy Audit
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repository
@@ -85,9 +88,14 @@ jobs:
           persist-credentials: false
 
       - name: Run cargo audit
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run cargo-deny checks
+        uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
+        with:
+          arguments: --locked --all-features
 
   workflow-audit:
     name: Workflow Security Audit (zizmor)

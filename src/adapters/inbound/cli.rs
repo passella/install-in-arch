@@ -7,11 +7,12 @@ use crate::application::install_package::{InstallPackageCommand, InstallPackageU
 use crate::application::list_packages::ListInstalledPackagesUseCase;
 use crate::application::uninstall_package::{UninstallPackageCommand, UninstallPackageUseCase};
 use crate::domain::error::DomainError;
-use crate::domain::models::{InstallOptions, UninstallOptions};
+use crate::domain::models::{DEFAULT_MAX_UNCOMPRESSED_BYTES, InstallOptions, UninstallOptions};
 use crate::domain::ports::{
     ArchPackageConverterPort, ArchPackageRepository, ClockPort, SourcePackageInspectorPort,
     SystemPackageManagerPort,
 };
+use crate::domain::sanitizer::sanitize_terminal_text;
 
 #[derive(Parser, Debug, Clone, PartialEq, Eq)]
 #[command(
@@ -81,6 +82,82 @@ pub struct CliArgs {
         help = "Keep unused dependencies when uninstalling (uses pacman -R instead of -Rs)"
     )]
     pub keep_deps: bool,
+
+    #[arg(
+        long = "allow-replace-foreign",
+        conflicts_with = "list",
+        help = "Allow replacing or uninstalling packages not originally packaged by install-in-arch"
+    )]
+    pub allow_replace_foreign: bool,
+
+    #[arg(
+        long = "allow-suid",
+        conflicts_with = "list",
+        help = "Preserve SUID/SGID permission bits on converted files instead of stripping them (still strips world-writable bit)"
+    )]
+    pub allow_suid: bool,
+
+    #[arg(
+        long = "max-uncompressed-size",
+        value_name = "SIZE",
+        default_value_t = DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        value_parser = parse_byte_size,
+        help = "Maximum uncompressed payload size in bytes (supports suffixes K, M, G, KiB, MiB, GiB; default: 4 GiB)"
+    )]
+    pub max_uncompressed_size: u64,
+
+    #[arg(
+        long = "staging-dir",
+        value_name = "DIR",
+        help = "Directory for temporary payload staging (defaults to $XDG_CACHE_HOME/install-in-arch or system temp)"
+    )]
+    pub staging_dir: Option<PathBuf>,
+}
+
+pub fn parse_byte_size(raw: &str) -> Result<u64, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("byte size cannot be empty".to_string());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let (digits_part, multiplier): (&str, u64) = if let Some(num) = lower.strip_suffix("gib") {
+        (num, 1024 * 1024 * 1024)
+    } else if let Some(num) = lower.strip_suffix("mib") {
+        (num, 1024 * 1024)
+    } else if let Some(num) = lower.strip_suffix("kib") {
+        (num, 1024)
+    } else if let Some(num) = lower.strip_suffix("gb") {
+        (num, 1000 * 1000 * 1000)
+    } else if let Some(num) = lower.strip_suffix("mb") {
+        (num, 1000 * 1000)
+    } else if let Some(num) = lower.strip_suffix("kb") {
+        (num, 1000)
+    } else if let Some(num) = lower.strip_suffix('g') {
+        (num, 1024 * 1024 * 1024)
+    } else if let Some(num) = lower.strip_suffix('m') {
+        (num, 1024 * 1024)
+    } else if let Some(num) = lower.strip_suffix('k') {
+        (num, 1024)
+    } else if let Some(num) = lower.strip_suffix('b') {
+        (num, 1)
+    } else {
+        (lower.as_str(), 1)
+    };
+
+    let num_str = digits_part.trim();
+    if num_str.is_empty() || !num_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("invalid byte size '{trimmed}'"));
+    }
+    let value = num_str
+        .parse::<u64>()
+        .map_err(|_| format!("byte size overflow in '{trimmed}'"))?;
+    let total = value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("byte size overflow in '{trimmed}'"))?;
+    if total == 0 {
+        return Err("byte size must be greater than zero".to_string());
+    }
+    Ok(total)
 }
 
 pub struct CliDispatcher<'a> {
@@ -114,6 +191,16 @@ impl<'a> CliDispatcher<'a> {
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
     ) -> Result<(), DomainError> {
+        self.dispatch_inner(args, stdout, stderr)
+            .map_err(DomainError::sanitized)
+    }
+
+    fn dispatch_inner(
+        &self,
+        args: CliArgs,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> Result<(), DomainError> {
         if args.list {
             let use_case = ListInstalledPackagesUseCase::new(self.package_manager);
             let packages = use_case.execute()?;
@@ -125,7 +212,10 @@ impl<'a> CliDispatcher<'a> {
                 let _ = writeln!(
                     stdout,
                     "{} {} ({}) - {}",
-                    pkg.name, pkg.version, pkg.architecture, pkg.description
+                    sanitize_terminal_text(&pkg.name),
+                    sanitize_terminal_text(&pkg.version),
+                    sanitize_terminal_text(&pkg.architecture),
+                    sanitize_terminal_text(&pkg.description)
                 );
             }
             return Ok(());
@@ -143,14 +233,20 @@ impl<'a> CliDispatcher<'a> {
                     dry_run: args.dry_run,
                     auto_confirm: args.yes,
                     keep_deps: args.keep_deps,
+                    allow_replace_foreign: args.allow_replace_foreign,
                 },
             })?;
+
+            for warning in &outcome.warnings {
+                let _ = writeln!(stderr, "Warning: {}", sanitize_terminal_text(warning));
+            }
 
             if outcome.dry_run {
                 let _ = writeln!(
                     stdout,
                     "[dry-run] Would uninstall '{}' via: {}",
-                    outcome.package_name, outcome.command_preview
+                    outcome.package_name,
+                    sanitize_terminal_text(&outcome.command_preview)
                 );
             } else {
                 let _ = writeln!(
@@ -178,11 +274,15 @@ impl<'a> CliDispatcher<'a> {
                 dry_run: args.dry_run,
                 auto_confirm: args.yes,
                 keep_pkg_dir: args.keep_pkg,
+                allow_replace_foreign: args.allow_replace_foreign,
+                allow_suid: args.allow_suid,
+                max_uncompressed_bytes: args.max_uncompressed_size,
+                staging_dir: args.staging_dir,
             },
         })?;
 
         for warning in &outcome.warnings {
-            let _ = writeln!(stderr, "Warning: {warning}");
+            let _ = writeln!(stderr, "Warning: {}", sanitize_terminal_text(warning));
         }
 
         let _ = writeln!(
@@ -201,16 +301,24 @@ impl<'a> CliDispatcher<'a> {
             let _ = writeln!(
                 stdout,
                 "Dependencies: {}",
-                outcome.resolved_dependencies.arch_dependencies.join(", ")
+                sanitize_terminal_text(&outcome.resolved_dependencies.arch_dependencies.join(", "))
             );
         }
 
         if let Some(kept_path) = outcome.kept_package_path.as_ref() {
-            let _ = writeln!(stdout, "Saved Arch package: {}", kept_path.display());
+            let _ = writeln!(
+                stdout,
+                "Saved Arch package: {}",
+                sanitize_terminal_text(&kept_path.display().to_string())
+            );
         }
 
         if outcome.dry_run {
-            let _ = writeln!(stdout, "[dry-run] Would run: {}", outcome.command_preview);
+            let _ = writeln!(
+                stdout,
+                "[dry-run] Would run: {}",
+                sanitize_terminal_text(&outcome.command_preview)
+            );
         } else {
             let _ = writeln!(
                 stdout,

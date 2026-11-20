@@ -1,9 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::domain::error::DomainError;
 use crate::domain::models::{DependencyClause, ResolvedDependencies, SourcePackageFormat};
 use crate::domain::ports::ArchPackageRepository;
 use crate::domain::rpm_dependency_parser::is_internal_rpm_capability;
+use crate::domain::sanitizer::sanitize_for_error;
 
 pub struct DependencyResolver<'a> {
     arch_repo: &'a dyn ArchPackageRepository,
@@ -38,9 +39,10 @@ impl<'a> DependencyResolver<'a> {
         let mut seen_resolved = HashSet::new();
         let mut unresolved = Vec::new();
         let mut seen_unresolved = HashSet::new();
+        let mut alt_cache: HashMap<String, Option<String>> = HashMap::new();
 
         for clause in clauses {
-            if let Some(arch_pkg) = self.resolve_clause(format, clause)? {
+            if let Some(arch_pkg) = self.resolve_clause(format, clause, &mut alt_cache)? {
                 if seen_resolved.insert(arch_pkg.clone()) {
                     resolved.push(arch_pkg);
                 }
@@ -63,13 +65,21 @@ impl<'a> DependencyResolver<'a> {
         &self,
         format: &SourcePackageFormat,
         clause: &DependencyClause,
+        alt_cache: &mut HashMap<String, Option<String>>,
     ) -> Result<Option<String>, DomainError> {
         for alt in &clause.alternatives {
             if alt.package_name.starts_with('-') {
                 return Err(DomainError::InvalidControlMetadata(format!(
                     "dependency name cannot start with '-': '{}'",
-                    alt.package_name
+                    sanitize_for_error(&alt.package_name)
                 )));
+            }
+
+            if let Some(cached) = alt_cache.get(&alt.package_name) {
+                if let Some(pkg) = cached {
+                    return Ok(Some(pkg.clone()));
+                }
+                continue;
             }
 
             let found = match format {
@@ -78,6 +88,7 @@ impl<'a> DependencyResolver<'a> {
                 SourcePackageFormat::Unsupported(_) => None,
             };
 
+            alt_cache.insert(alt.package_name.clone(), found.clone());
             if let Some(pkg) = found {
                 return Ok(Some(pkg));
             }
@@ -649,6 +660,10 @@ mod tests {
                 });
             }
             Ok(self.packages.contains(package_name))
+        }
+
+        fn is_native_sync_package(&self, package_name: &str) -> Result<bool, DomainError> {
+            self.package_exists(package_name)
         }
     }
 

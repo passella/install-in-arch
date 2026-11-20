@@ -65,12 +65,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "ar"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d67af77d68a931ecd5cbd8a3b5987d63a1d1d1278f7f6a60ae33db485cdebb69"
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -370,7 +364,6 @@ name = "install-in-arch"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "ar",
  "bzip2",
  "clap",
  "flate2",
@@ -378,6 +371,7 @@ dependencies = [
  "liblzma",
  "md-5",
  "rpm",
+ "rustix",
  "sha2 0.11.1",
  "tar",
  "tempfile",

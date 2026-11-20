@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+use crate::domain::sanitizer::sanitize_for_error;
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DomainError {
     #[error("input file not found: {0}")]
@@ -39,9 +41,82 @@ pub enum DomainError {
     #[error("package '{0}' is not installed")]
     PackageNotInstalled(String),
 
+    #[error(
+        "refusing to modify foreign or native package '{package}' (packager: '{packager}'); pass --allow-replace-foreign to override"
+    )]
+    ForeignPackageConflict { package: String, packager: String },
+
+    #[error("archive resource limit exceeded for {resource} (limit {limit}) during {context}")]
+    ResourceLimitExceeded {
+        resource: String,
+        limit: u64,
+        context: String,
+    },
+
     #[error("external command '{command}' failed: {reason}")]
     CommandExecutionFailed { command: String, reason: String },
 
     #[error("I/O error during {context}: {reason}")]
     Io { context: String, reason: String },
+}
+
+impl DomainError {
+    pub fn sanitized(self) -> Self {
+        match self {
+            Self::InputFileNotFound(path) => Self::InputFileNotFound(path),
+            Self::UnsupportedPackageFormat(fmt) => {
+                Self::UnsupportedPackageFormat(sanitize_for_error(&fmt))
+            }
+            Self::InvalidDebArchive { path, reason } => Self::InvalidDebArchive {
+                path,
+                reason: sanitize_for_error(&reason),
+            },
+            Self::InvalidRpmArchive { path, reason } => Self::InvalidRpmArchive {
+                path,
+                reason: sanitize_for_error(&reason),
+            },
+            Self::UnsupportedArchiveCompression { member, reason } => {
+                Self::UnsupportedArchiveCompression {
+                    member: sanitize_for_error(&member),
+                    reason: sanitize_for_error(&reason),
+                }
+            }
+            Self::InvalidControlMetadata(msg) => {
+                Self::InvalidControlMetadata(sanitize_for_error(&msg))
+            }
+            Self::InvalidPackageName(name) => Self::InvalidPackageName(sanitize_for_error(&name)),
+            Self::InvalidPackageVersion(ver) => {
+                Self::InvalidPackageVersion(sanitize_for_error(&ver))
+            }
+            Self::UnsafePathTraversal(raw) => Self::UnsafePathTraversal(sanitize_for_error(&raw)),
+            Self::ReservedPackageMetadataPath(raw) => {
+                Self::ReservedPackageMetadataPath(sanitize_for_error(&raw))
+            }
+            Self::UnresolvedDependencies(deps) => Self::UnresolvedDependencies(
+                deps.into_iter().map(|d| sanitize_for_error(&d)).collect(),
+            ),
+            Self::PackageNotInstalled(pkg) => Self::PackageNotInstalled(sanitize_for_error(&pkg)),
+            Self::ForeignPackageConflict { package, packager } => Self::ForeignPackageConflict {
+                package: sanitize_for_error(&package),
+                packager: sanitize_for_error(&packager),
+            },
+            Self::ResourceLimitExceeded {
+                resource,
+                limit,
+                context,
+            } => Self::ResourceLimitExceeded {
+                resource: sanitize_for_error(&resource),
+                limit,
+                context: sanitize_for_error(&context),
+            },
+            Self::CommandExecutionFailed { command, reason } => Self::CommandExecutionFailed {
+                command: sanitize_for_error(&command),
+                reason: sanitize_for_error(&reason),
+            },
+            Self::Io { context, reason } => Self::Io {
+                context: sanitize_for_error(&context),
+                reason: sanitize_for_error(&reason),
+            },
+        }
+    }
 }

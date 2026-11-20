@@ -1,10 +1,15 @@
 use std::fs;
 use std::io::ErrorKind;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::error::DomainError;
 use crate::domain::ports::ClockPort;
+use crate::domain::sanitizer::sanitize_for_error;
+
+const SAFE_SYSTEM_PATH: &str = "/usr/bin:/usr/sbin";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
@@ -36,39 +41,52 @@ pub trait CommandRunnerPort {
 
 pub struct SystemPrivilegeDetector;
 
-impl SystemPrivilegeDetector {
-    pub fn parse_effective_uid_from_proc_status(status_content: &str) -> Option<u32> {
-        for line in status_content.lines() {
-            if let Some(rest) = line.strip_prefix("Uid:") {
-                let mut parts = rest.split_whitespace();
-                let _real = parts.next()?;
-                let effective = parts.next()?;
-                return effective.parse::<u32>().ok();
-            }
-        }
-        None
-    }
-}
-
 impl PrivilegeDetectorPort for SystemPrivilegeDetector {
     fn is_root(&self) -> bool {
-        if let Ok(content) = fs::read_to_string("/proc/self/status")
-            && let Some(euid) = Self::parse_effective_uid_from_proc_status(&content)
-        {
-            return euid == 0;
-        }
-
-        Command::new("id")
-            .arg("-u")
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .and_then(|out| String::from_utf8(out.stdout).ok())
-            .is_some_and(|s| s.trim() == "0")
+        rustix::process::geteuid().is_root()
     }
 }
 
 pub struct SystemCommandRunner;
+
+impl SystemCommandRunner {
+    fn verify_trusted_executable(program: &str, args: &[&str]) -> Result<(), DomainError> {
+        let command = format!("{program} {}", args.join(" "));
+        let path = Path::new(program);
+        if !path.is_absolute() {
+            return Err(DomainError::CommandExecutionFailed {
+                command: sanitize_for_error(&command),
+                reason: "refusing non-absolute executable path".to_string(),
+            });
+        }
+        let meta = fs::metadata(path).map_err(|err| map_spawn_error(program, args, &err))?;
+        if !meta.is_file() {
+            return Err(DomainError::CommandExecutionFailed {
+                command: sanitize_for_error(&command),
+                reason: "target executable is not a regular file".to_string(),
+            });
+        }
+        if meta.uid() != 0 {
+            return Err(DomainError::CommandExecutionFailed {
+                command: sanitize_for_error(&command),
+                reason: format!(
+                    "executable '{}' is not owned by root",
+                    sanitize_for_error(program)
+                ),
+            });
+        }
+        if (meta.mode() & 0o022) != 0 {
+            return Err(DomainError::CommandExecutionFailed {
+                command: sanitize_for_error(&command),
+                reason: format!(
+                    "executable '{}' has unsafe group/world write permissions",
+                    sanitize_for_error(program)
+                ),
+            });
+        }
+        Ok(())
+    }
+}
 
 impl CommandRunnerPort for SystemCommandRunner {
     fn run_capture(
@@ -77,8 +95,9 @@ impl CommandRunnerPort for SystemCommandRunner {
         args: &[&str],
         env: &[(&str, &str)],
     ) -> Result<CommandOutput, DomainError> {
+        Self::verify_trusted_executable(program, args)?;
         let mut cmd = Command::new(program);
-        cmd.args(args);
+        cmd.args(args).env("PATH", SAFE_SYSTEM_PATH);
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -100,8 +119,10 @@ impl CommandRunnerPort for SystemCommandRunner {
         args: &[&str],
         env: &[(&str, &str)],
     ) -> Result<i32, DomainError> {
+        Self::verify_trusted_executable(program, args)?;
         let mut cmd = Command::new(program);
         cmd.args(args)
+            .env("PATH", SAFE_SYSTEM_PATH)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
@@ -118,7 +139,7 @@ impl CommandRunnerPort for SystemCommandRunner {
         } else {
             let code = status.code().unwrap_or(1);
             Err(DomainError::CommandExecutionFailed {
-                command: format!("{program} {}", args.join(" ")),
+                command: sanitize_for_error(&format!("{program} {}", args.join(" "))),
                 reason: format!("exited with status code {code}"),
             })
         }
@@ -126,11 +147,11 @@ impl CommandRunnerPort for SystemCommandRunner {
 }
 
 fn map_spawn_error(program: &str, args: &[&str], err: &std::io::Error) -> DomainError {
-    let command = format!("{program} {}", args.join(" "));
+    let command = sanitize_for_error(&format!("{program} {}", args.join(" ")));
     let reason = if err.kind() == ErrorKind::NotFound {
-        format!("executable '{program}' not found in PATH")
+        format!("executable '{}' not found", sanitize_for_error(program))
     } else {
-        err.to_string()
+        sanitize_for_error(&err.to_string())
     };
     DomainError::CommandExecutionFailed { command, reason }
 }
@@ -148,25 +169,25 @@ impl ClockPort for SystemClock {
 
 #[cfg(test)]
 mod tests {
-    use super::SystemPrivilegeDetector;
+    use super::{CommandRunnerPort, SystemCommandRunner, SystemPrivilegeDetector};
+    use crate::adapters::outbound::system_process::PrivilegeDetectorPort;
+    use crate::domain::error::DomainError;
+    use crate::domain::ports::ClockPort;
+    use crate::domain::ports::TempStorageGuard;
 
     #[test]
-    fn parses_effective_uid_from_proc_status() {
-        let root_status = "Name:\ttest\nUid:\t1000\t0\t0\t0\n";
-        assert_eq!(
-            SystemPrivilegeDetector::parse_effective_uid_from_proc_status(root_status),
-            Some(0)
-        );
+    fn rejects_relative_executable_paths_without_spawning() {
+        let runner = SystemCommandRunner;
+        let err = runner.run_capture("pacman", &["-V"], &[]);
+        assert!(matches!(
+            err,
+            Err(DomainError::CommandExecutionFailed { .. })
+        ));
 
-        let user_status = "Name:\ttest\nUid:\t1000\t1000\t1000\t1000\n";
-        assert_eq!(
-            SystemPrivilegeDetector::parse_effective_uid_from_proc_status(user_status),
-            Some(1000)
-        );
-
-        assert_eq!(
-            SystemPrivilegeDetector::parse_effective_uid_from_proc_status("NoUidHere\n"),
-            None
-        );
+        let detector = SystemPrivilegeDetector;
+        let _is_root = detector.is_root();
+        let clock = super::SystemClock;
+        assert!(clock.unix_timestamp_secs() > 0);
+        let _: Option<Box<dyn TempStorageGuard>> = None;
     }
 }

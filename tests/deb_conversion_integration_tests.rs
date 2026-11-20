@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Cursor, Read, Write};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ar::Builder as ArBuilder;
 use bzip2::Compression as BzCompression;
 use bzip2::write::BzEncoder;
 use flate2::Compression as GzCompression;
+use flate2::Crc as FlateCrc;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use liblzma::write::XzEncoder;
@@ -24,7 +25,9 @@ use install_in_arch::application::uninstall_package::{
     UninstallPackageCommand, UninstallPackageUseCase,
 };
 use install_in_arch::domain::error::DomainError;
-use install_in_arch::domain::models::{InstallOptions, PackageName, UninstallOptions};
+use install_in_arch::domain::models::{
+    InstallOptions, InstalledPackageSummary, PackageName, PkgInfoMetadata, UninstallOptions,
+};
 use install_in_arch::domain::path_normalizer::is_conflicting_arch_path;
 use install_in_arch::domain::ports::{
     ArchPackageConverterPort, ArchPackageRepository, ClockPort, SourcePackageInspectorPort,
@@ -75,6 +78,10 @@ impl ArchPackageRepository for FakeRepo {
     fn package_exists(&self, package_name: &str) -> Result<bool, DomainError> {
         Ok(self.0.contains(package_name))
     }
+
+    fn is_native_sync_package(&self, package_name: &str) -> Result<bool, DomainError> {
+        Ok(self.0.contains(package_name))
+    }
 }
 
 struct RecordingPackageManager {
@@ -84,6 +91,23 @@ struct RecordingPackageManager {
 impl SystemPackageManagerPort for RecordingPackageManager {
     fn is_installed(&self, package_name: &PackageName) -> Result<bool, DomainError> {
         Ok(self.installed.contains(package_name.as_str()))
+    }
+
+    fn installed_package_info(
+        &self,
+        package_name: &PackageName,
+    ) -> Result<Option<InstalledPackageSummary>, DomainError> {
+        if self.installed.contains(package_name.as_str()) {
+            Ok(Some(InstalledPackageSummary {
+                name: package_name.to_string(),
+                version: "1.0-1".to_string(),
+                architecture: "x86_64".to_string(),
+                description: "Installed test package".to_string(),
+                packager: PkgInfoMetadata::DEFAULT_PACKAGER.to_string(),
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     fn install_local_package(
@@ -106,12 +130,15 @@ impl SystemPackageManagerPort for RecordingPackageManager {
     fn list_managed_packages(
         &self,
         _packager_marker: &str,
-    ) -> Result<Vec<install_in_arch::domain::models::InstalledPackageSummary>, DomainError> {
+    ) -> Result<Vec<InstalledPackageSummary>, DomainError> {
         Ok(Vec::new())
     }
 
     fn install_command_preview(&self, package_archive: &Path, _auto_confirm: bool) -> String {
-        format!("sudo pacman -U {}", package_archive.display())
+        format!(
+            "/usr/bin/sudo /usr/bin/pacman -U -- {}",
+            package_archive.display()
+        )
     }
 
     fn uninstall_command_preview(
@@ -120,8 +147,36 @@ impl SystemPackageManagerPort for RecordingPackageManager {
         _keep_deps: bool,
         _auto_confirm: bool,
     ) -> String {
-        format!("sudo pacman -Rs {package_name}")
+        format!("/usr/bin/sudo /usr/bin/pacman -Rs -- {package_name}")
     }
+}
+
+fn append_common_ar_member(
+    out: &mut impl Write,
+    ident: &str,
+    body: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut header = [b' '; 60];
+    let ident_bytes = ident.as_bytes();
+    let copy_len = ident_bytes.len().min(16);
+    if let Some(dst) = header.get_mut(..copy_len)
+        && let Some(src) = ident_bytes.get(..copy_len)
+    {
+        dst.copy_from_slice(src);
+    }
+    header[16..28].copy_from_slice(b"0           ");
+    header[28..34].copy_from_slice(b"0     ");
+    header[34..40].copy_from_slice(b"0     ");
+    header[40..48].copy_from_slice(b"100644  ");
+    let size_text = format!("{:<10}", body.len());
+    header[48..58].copy_from_slice(size_text.as_bytes());
+    header[58..60].copy_from_slice(b"`\n");
+    out.write_all(&header)?;
+    out.write_all(body)?;
+    if body.len() % 2 == 1 {
+        out.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 fn build_compressed_tar(
@@ -191,29 +246,23 @@ fn write_synthetic_deb(
     data_compression: TarCompression,
     data_entries: Option<&[SyntheticDebEntry]>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let out_file = File::create(dest_path)?;
-    let mut ar_builder = ArBuilder::new(out_file);
+    let mut out_file = File::create(dest_path)?;
+    out_file.write_all(b"!<arch>\n")?;
 
     if let Some(bin_bytes) = debian_binary {
-        let mut h = ar::Header::new(b"debian-binary".to_vec(), bin_bytes.len() as u64);
-        h.set_mode(0o100644);
-        ar_builder.append(&h, Cursor::new(bin_bytes))?;
+        append_common_ar_member(&mut out_file, "debian-binary", bin_bytes)?;
     }
 
     if let Some(entries) = control_entries {
         let bytes = build_compressed_tar(entries, control_compression)?;
         let member_name = format!("control.tar{}", control_compression.extension());
-        let mut h = ar::Header::new(member_name.into_bytes(), bytes.len() as u64);
-        h.set_mode(0o100644);
-        ar_builder.append(&h, Cursor::new(bytes))?;
+        append_common_ar_member(&mut out_file, &member_name, &bytes)?;
     }
 
     if let Some(entries) = data_entries {
         let bytes = build_compressed_tar(entries, data_compression)?;
         let member_name = format!("data.tar{}", data_compression.extension());
-        let mut h = ar::Header::new(member_name.into_bytes(), bytes.len() as u64);
-        h.set_mode(0o100644);
-        ar_builder.append(&h, Cursor::new(bytes))?;
+        append_common_ar_member(&mut out_file, &member_name, &bytes)?;
     }
 
     Ok(())
@@ -283,10 +332,8 @@ fn missing_and_corrupt_deb_archives_fail_cleanly() -> Result<(), Box<dyn std::er
         source_path: bad_version_deb,
         options: InstallOptions {
             ignore_deps: true,
-            strict_deps: false,
             dry_run: true,
-            auto_confirm: false,
-            keep_pkg_dir: None,
+            ..InstallOptions::default()
         },
     });
     assert!(matches!(err, Err(DomainError::InvalidDebArchive { .. })));
@@ -352,21 +399,12 @@ fn rejects_path_traversal_inside_data_archive() -> Result<(), Box<dyn std::error
     xz_enc.write_all(&raw_data_tar)?;
     let data_xz = xz_enc.finish()?;
 
-    let out_file = File::create(&deb_path)?;
-    let mut ar_builder = ArBuilder::new(out_file);
-    let bin_bytes = b"2.0\n";
-    let mut h_bin = ar::Header::new(b"debian-binary".to_vec(), bin_bytes.len() as u64);
-    h_bin.set_mode(0o100644);
-    ar_builder.append(&h_bin, Cursor::new(bin_bytes))?;
-
+    let mut out_file = File::create(&deb_path)?;
+    out_file.write_all(b"!<arch>\n")?;
+    append_common_ar_member(&mut out_file, "debian-binary", b"2.0\n")?;
     let ctrl_bytes = build_compressed_tar(&control_entries, TarCompression::Gzip)?;
-    let mut h_ctrl = ar::Header::new(b"control.tar.gz".to_vec(), ctrl_bytes.len() as u64);
-    h_ctrl.set_mode(0o100644);
-    ar_builder.append(&h_ctrl, Cursor::new(ctrl_bytes))?;
-
-    let mut h_data = ar::Header::new(b"data.tar.xz".to_vec(), data_xz.len() as u64);
-    h_data.set_mode(0o100644);
-    ar_builder.append(&h_data, Cursor::new(data_xz))?;
+    append_common_ar_member(&mut out_file, "control.tar.gz", &ctrl_bytes)?;
+    append_common_ar_member(&mut out_file, "data.tar.xz", &data_xz)?;
 
     let adapter = DebPackageAdapter::new();
     let repo = FakeRepo(HashSet::new());
@@ -382,10 +420,8 @@ fn rejects_path_traversal_inside_data_archive() -> Result<(), Box<dyn std::error
         source_path: deb_path,
         options: InstallOptions {
             ignore_deps: true,
-            strict_deps: false,
             dry_run: true,
-            auto_confirm: false,
-            keep_pkg_dir: None,
+            ..InstallOptions::default()
         },
     });
     assert!(matches!(err, Err(DomainError::UnsafePathTraversal(_))));
@@ -580,11 +616,9 @@ Description: Epic Games Launcher Wrapper
     let outcome = install_uc.execute(InstallPackageCommand {
         source_path: deb_path.clone(),
         options: InstallOptions {
-            ignore_deps: false,
-            strict_deps: false,
             dry_run: true,
-            auto_confirm: false,
             keep_pkg_dir: Some(keep_dir),
+            ..InstallOptions::default()
         },
     })?;
 
@@ -592,7 +626,13 @@ Description: Epic Games Launcher Wrapper
     assert_eq!(outcome.metadata.pkgver.as_str(), "1.2.3.4-2");
     assert_eq!(outcome.metadata.arch.as_str(), "x86_64");
     assert_eq!(outcome.maintainer_scripts, vec!["postinst"]);
-    assert_eq!(outcome.warnings.len(), 2);
+    assert_eq!(outcome.warnings.len(), 3);
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.contains("Stripped SUID/SGID"))
+    );
 
     let pkg_path = outcome
         .kept_package_path
@@ -649,7 +689,7 @@ Description: Epic Games Launcher Wrapper
     assert_eq!(entry_modes.get("usr/bin/epic-cli"), Some(&0o755));
     assert_eq!(
         entry_modes.get("opt/Epic Games/chrome-sandbox"),
-        Some(&0o4755)
+        Some(&0o755)
     );
     assert_eq!(entry_modes.get("usr/sbin/epic-admin"), None);
     assert_eq!(entry_modes.get("usr/bin/epic-admin"), Some(&0o750));
@@ -694,7 +734,7 @@ Description: Epic Games Launcher Wrapper
         binary_payload.len(),
         hex::encode(Md5::digest(binary_payload))
     )));
-    assert!(mtree_text.contains("./opt/Epic\\040Games/chrome-sandbox time=1700000200.0 mode=4755"));
+    assert!(mtree_text.contains("./opt/Epic\\040Games/chrome-sandbox time=1700000200.0 mode=755"));
     assert!(mtree_text.contains(
         "./usr/bin/epic\\040launcher time=1700000200.0 mode=777 type=link link=../../opt/Epic\\040Games/chrome-sandbox"
     ));
@@ -704,18 +744,17 @@ Description: Epic Games Launcher Wrapper
         target: deb_path.to_string_lossy().into_owned(),
         options: UninstallOptions {
             dry_run: true,
-            auto_confirm: false,
-            keep_deps: false,
+            ..UninstallOptions::default()
         },
     })?;
     assert_eq!(uninstall_out.package_name.as_str(), "epicgameslauncher");
 
-    if let Ok(output) = Command::new("pacman")
-        .arg("-Qpi")
-        .arg(&pkg_path)
-        .env("LC_ALL", "C")
-        .output()
-    {
+    if Path::new("/usr/bin/pacman").exists() {
+        let output = Command::new("/usr/bin/pacman")
+            .arg("-Qpi")
+            .arg(&pkg_path)
+            .env("LC_ALL", "C")
+            .output()?;
         assert!(
             output.status.success(),
             "pacman -Qpi failed: {}",
@@ -726,23 +765,51 @@ Description: Epic Games Launcher Wrapper
         assert!(qpi.contains("Version         : 1.2.3.4-2"));
         assert!(qpi.contains("Architecture    : x86_64"));
         assert!(qpi.contains("install-in-arch <install-in-arch@local>"));
-    }
 
-    if let Ok(output) = Command::new("pacman")
-        .arg("-Qpl")
-        .arg(&pkg_path)
-        .env("LC_ALL", "C")
-        .output()
-    {
+        let qpl_output = Command::new("/usr/bin/pacman")
+            .arg("-Qpl")
+            .arg(&pkg_path)
+            .env("LC_ALL", "C")
+            .output()?;
         assert!(
-            output.status.success(),
+            qpl_output.status.success(),
             "pacman -Qpl failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&qpl_output.stderr)
         );
-        let qpl = String::from_utf8_lossy(&output.stdout);
+        let qpl = String::from_utf8_lossy(&qpl_output.stdout);
         assert!(qpl.contains("/usr/bin/epic-cli"));
         assert!(qpl.contains("/opt/Epic Games/chrome-sandbox"));
     }
+
+    let suid_out_dir = dir.path().join("out_suid");
+    let suid_outcome = install_uc.execute(InstallPackageCommand {
+        source_path: deb_path,
+        options: InstallOptions {
+            dry_run: true,
+            allow_suid: true,
+            keep_pkg_dir: Some(suid_out_dir),
+            ..InstallOptions::default()
+        },
+    })?;
+    assert!(
+        suid_outcome
+            .warnings
+            .iter()
+            .any(|w| w.contains("Preserving SUID/SGID"))
+    );
+    let suid_pkg_path = suid_outcome
+        .kept_package_path
+        .ok_or("expected kept suid pkg path")?;
+    let mut suid_tar = Archive::new(ZstdDecoder::new(File::open(&suid_pkg_path)?)?);
+    let mut found_suid = false;
+    for entry_res in suid_tar.entries()? {
+        let entry = entry_res?;
+        if entry.path()?.to_string_lossy() == "opt/Epic Games/chrome-sandbox" {
+            assert_eq!(entry.header().mode()? & 0o7777, 0o4755);
+            found_suid = true;
+        }
+    }
+    assert!(found_suid);
 
     Ok(())
 }
@@ -803,10 +870,9 @@ fn supports_all_deb_compression_formats_for_control_and_data()
             source_path: deb_path,
             options: InstallOptions {
                 ignore_deps: true,
-                strict_deps: false,
                 dry_run: true,
-                auto_confirm: false,
                 keep_pkg_dir: Some(out_dir),
+                ..InstallOptions::default()
             },
         })?;
         assert_eq!(outcome.metadata.arch.as_str(), "any");
@@ -890,10 +956,9 @@ fn handles_long_paths_and_long_symlinks_over_100_bytes() -> Result<(), Box<dyn s
         source_path: deb_path,
         options: InstallOptions {
             ignore_deps: true,
-            strict_deps: false,
             dry_run: true,
-            auto_confirm: false,
             keep_pkg_dir: Some(out_dir),
+            ..InstallOptions::default()
         },
     })?;
 
@@ -920,11 +985,12 @@ fn handles_long_paths_and_long_symlinks_over_100_bytes() -> Result<(), Box<dyn s
     assert!(found_file);
     assert!(found_link);
 
-    if let Ok(output) = Command::new("pacman")
-        .arg("-Qpl")
-        .arg(&pkg_path)
-        .env("LC_ALL", "C")
-        .output()
+    if Path::new("/usr/bin/pacman").exists()
+        && let Ok(output) = Command::new("/usr/bin/pacman")
+            .arg("-Qpl")
+            .arg(&pkg_path)
+            .env("LC_ALL", "C")
+            .output()
     {
         assert!(output.status.success());
         let qpl = String::from_utf8_lossy(&output.stdout);
@@ -978,7 +1044,11 @@ fn validates_streaming_performance_and_readonly_host_pacman_repository()
     let inspectors: [&dyn SourcePackageInspectorPort; 1] = [&adapter];
     let converters: [&dyn ArchPackageConverterPort; 1] = [&adapter];
 
-    let has_pacman = Command::new("pacman").arg("--version").output().is_ok();
+    let has_pacman = Path::new("/usr/bin/pacman").exists()
+        && Command::new("/usr/bin/pacman")
+            .arg("--version")
+            .output()
+            .is_ok();
     let fallback_repo = FakeRepo(
         ["webkit2gtk-4.1", "gtk3", "libayatana-appindicator", "sdl2"]
             .into_iter()
@@ -1000,11 +1070,10 @@ fn validates_streaming_performance_and_readonly_host_pacman_repository()
     let outcome = uc.execute(InstallPackageCommand {
         source_path: deb_path,
         options: InstallOptions {
-            ignore_deps: false,
             strict_deps: true,
             dry_run: true,
-            auto_confirm: false,
             keep_pkg_dir: Some(out_dir),
+            ..InstallOptions::default()
         },
     })?;
     let elapsed = start.elapsed();
@@ -1077,10 +1146,8 @@ fn rejects_reserved_pacman_metadata_paths_unsafe_arch_and_hyphen_deps()
             source_path: deb_path,
             options: InstallOptions {
                 ignore_deps: true,
-                strict_deps: false,
                 dry_run: true,
-                auto_confirm: false,
-                keep_pkg_dir: None,
+                ..InstallOptions::default()
             },
         });
         assert!(matches!(
@@ -1126,11 +1193,8 @@ fn rejects_reserved_pacman_metadata_paths_unsafe_arch_and_hyphen_deps()
         let err = uc.execute(InstallPackageCommand {
             source_path: deb_path,
             options: InstallOptions {
-                ignore_deps: false,
-                strict_deps: false,
                 dry_run: true,
-                auto_confirm: false,
-                keep_pkg_dir: None,
+                ..InstallOptions::default()
             },
         });
         assert!(matches!(err, Err(DomainError::InvalidControlMetadata(_))));
@@ -1292,10 +1356,9 @@ Description: Collision Test
         source_path: deb_path,
         options: InstallOptions {
             ignore_deps: true,
-            strict_deps: false,
             dry_run: true,
-            auto_confirm: false,
             keep_pkg_dir: Some(out_dir),
+            ..InstallOptions::default()
         },
     })?;
 
@@ -1361,11 +1424,12 @@ Description: Collision Test
     ));
     assert!(mtree_text.contains("./opt/app/key\\075val.conf"));
 
-    if let Ok(output) = Command::new("pacman")
-        .arg("-Qpi")
-        .arg(&pkg_path)
-        .env("LC_ALL", "C")
-        .output()
+    if Path::new("/usr/bin/pacman").exists()
+        && let Ok(output) = Command::new("/usr/bin/pacman")
+            .arg("-Qpi")
+            .arg(&pkg_path)
+            .env("LC_ALL", "C")
+            .output()
     {
         assert!(output.status.success());
     }
@@ -1427,13 +1491,553 @@ fn rejects_directory_vs_file_collision_at_same_canonical_priority()
         source_path: deb_path,
         options: InstallOptions {
             ignore_deps: true,
-            strict_deps: false,
             dry_run: true,
-            auto_confirm: false,
-            keep_pkg_dir: None,
+            ..InstallOptions::default()
         },
     });
     assert!(matches!(err, Err(DomainError::InvalidDebArchive { .. })));
+
+    Ok(())
+}
+
+fn build_deb_from_entries(
+    dest_path: &Path,
+    pkg_name: &str,
+    data_entries: &[SyntheticDebEntry],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let control_entries = [SyntheticDebEntry {
+        path: "./control".to_string(),
+        entry_type: EntryType::Regular,
+        mode: 0o644,
+        mtime: 1_700_000_000,
+        data: format!("Package: {pkg_name}\nVersion: 1.0\nArchitecture: amd64\n").into_bytes(),
+        link_target: None,
+    }];
+    write_synthetic_deb(
+        dest_path,
+        Some(b"2.0\n"),
+        TarCompression::Gzip,
+        Some(&control_entries),
+        TarCompression::Gzip,
+        Some(data_entries),
+    )
+}
+
+#[test]
+fn strips_world_writable_and_suid_sgid_by_default_and_handles_keep_pkg_toctou_and_staging_dir()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let deb_path = dir.path().join("perms.deb");
+    let data_entries = [
+        SyntheticDebEntry {
+            path: "./usr/bin/suid-ww".to_string(),
+            entry_type: EntryType::Regular,
+            mode: 0o4777,
+            mtime: 1_700_000_000,
+            data: b"bin1".to_vec(),
+            link_target: None,
+        },
+        SyntheticDebEntry {
+            path: "./usr/bin/sgid-ww".to_string(),
+            entry_type: EntryType::Regular,
+            mode: 0o2776,
+            mtime: 1_700_000_000,
+            data: b"bin2".to_vec(),
+            link_target: None,
+        },
+        SyntheticDebEntry {
+            path: "./usr/bin/plain-ww".to_string(),
+            entry_type: EntryType::Regular,
+            mode: 0o666,
+            mtime: 1_700_000_000,
+            data: b"bin3".to_vec(),
+            link_target: None,
+        },
+    ];
+    build_deb_from_entries(&deb_path, "perm-test", &data_entries)?;
+
+    let adapter = DebPackageAdapter::new();
+    let repo = FakeRepo(HashSet::new());
+    let pm = RecordingPackageManager {
+        installed: HashSet::new(),
+    };
+    let clock = FixedClock(1_700_000_000);
+    let inspectors: [&dyn SourcePackageInspectorPort; 1] = [&adapter];
+    let converters: [&dyn ArchPackageConverterPort; 1] = [&adapter];
+    let uc = InstallPackageUseCase::new(&inspectors, &converters, &repo, &pm, &clock);
+
+    let out_default = dir.path().join("out_default");
+    let custom_stage = dir.path().join("custom_stage");
+    let default_outcome = uc.execute(InstallPackageCommand {
+        source_path: deb_path.clone(),
+        options: InstallOptions {
+            ignore_deps: true,
+            dry_run: true,
+            keep_pkg_dir: Some(out_default.clone()),
+            staging_dir: Some(custom_stage.clone()),
+            ..InstallOptions::default()
+        },
+    })?;
+    assert!(custom_stage.exists());
+    assert!(
+        fs::read_dir(&custom_stage)?.count() == 0,
+        "staging temp dir must be cleaned up"
+    );
+
+    let default_pkg = default_outcome
+        .kept_package_path
+        .ok_or("missing default pkg")?;
+    let mut modes_default = HashMap::new();
+    let mut tar_default = Archive::new(ZstdDecoder::new(File::open(&default_pkg)?)?);
+    for entry_res in tar_default.entries()? {
+        let entry = entry_res?;
+        let p = entry.path()?.to_string_lossy().into_owned();
+        modes_default.insert(p, entry.header().mode()? & 0o7777);
+    }
+    assert_eq!(modes_default.get("usr/bin/suid-ww"), Some(&0o0775));
+    assert_eq!(modes_default.get("usr/bin/sgid-ww"), Some(&0o0774));
+    assert_eq!(modes_default.get("usr/bin/plain-ww"), Some(&0o0664));
+
+    let out_suid = dir.path().join("out_suid");
+    let suid_outcome = uc.execute(InstallPackageCommand {
+        source_path: deb_path.clone(),
+        options: InstallOptions {
+            ignore_deps: true,
+            dry_run: true,
+            allow_suid: true,
+            keep_pkg_dir: Some(out_suid),
+            ..InstallOptions::default()
+        },
+    })?;
+    let suid_pkg = suid_outcome.kept_package_path.ok_or("missing suid pkg")?;
+    let mut modes_suid = HashMap::new();
+    let mut tar_suid = Archive::new(ZstdDecoder::new(File::open(&suid_pkg)?)?);
+    for entry_res in tar_suid.entries()? {
+        let entry = entry_res?;
+        let p = entry.path()?.to_string_lossy().into_owned();
+        modes_suid.insert(p, entry.header().mode()? & 0o7777);
+    }
+    assert_eq!(modes_suid.get("usr/bin/suid-ww"), Some(&0o4775));
+    assert_eq!(modes_suid.get("usr/bin/sgid-ww"), Some(&0o2774));
+
+    let clobber_dir = dir.path().join("clobber_out");
+    fs::create_dir_all(&clobber_dir)?;
+    let expected_name = "perm-test-1.0-1-x86_64.pkg.tar.zst";
+    let victim = dir.path().join("victim.txt");
+    fs::write(&victim, b"protected")?;
+    symlink(&victim, clobber_dir.join(expected_name))?;
+    let clobber_err = uc.execute(InstallPackageCommand {
+        source_path: deb_path.clone(),
+        options: InstallOptions {
+            ignore_deps: true,
+            dry_run: true,
+            keep_pkg_dir: Some(clobber_dir),
+            ..InstallOptions::default()
+        },
+    });
+    assert!(matches!(clobber_err, Err(DomainError::Io { .. })));
+    assert_eq!(fs::read(&victim)?, b"protected");
+
+    let unsafe_dir = dir.path().join("world_writable");
+    fs::create_dir_all(&unsafe_dir)?;
+    fs::set_permissions(&unsafe_dir, fs::Permissions::from_mode(0o777))?;
+    let unsafe_dir_err = uc.execute(InstallPackageCommand {
+        source_path: deb_path,
+        options: InstallOptions {
+            ignore_deps: true,
+            dry_run: true,
+            keep_pkg_dir: Some(unsafe_dir),
+            ..InstallOptions::default()
+        },
+    });
+    assert!(matches!(unsafe_dir_err, Err(DomainError::Io { .. })));
+
+    Ok(())
+}
+
+#[test]
+fn enforces_decompression_quotas_tar_extension_bounds_and_common_ar_hardening()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let adapter = DebPackageAdapter::new();
+    let repo = FakeRepo(HashSet::new());
+    let pm = RecordingPackageManager {
+        installed: HashSet::new(),
+    };
+    let clock = FixedClock(1_700_000_000);
+    let inspectors: [&dyn SourcePackageInspectorPort; 1] = [&adapter];
+    let converters: [&dyn ArchPackageConverterPort; 1] = [&adapter];
+    let uc = InstallPackageUseCase::new(&inspectors, &converters, &repo, &pm, &clock);
+
+    let bomb_deb = dir.path().join("quota_bomb.deb");
+    let big_data = [SyntheticDebEntry {
+        path: "./opt/app/big.bin".to_string(),
+        entry_type: EntryType::Regular,
+        mode: 0o644,
+        mtime: 1_700_000_000,
+        data: vec![0x41u8; 64 * 1024],
+        link_target: None,
+    }];
+    build_deb_from_entries(&bomb_deb, "quota-test", &big_data)?;
+    let quota_err = uc.execute(InstallPackageCommand {
+        source_path: bomb_deb,
+        options: InstallOptions {
+            ignore_deps: true,
+            dry_run: true,
+            max_uncompressed_bytes: 16 * 1024,
+            ..InstallOptions::default()
+        },
+    });
+    assert!(matches!(
+        quota_err,
+        Err(DomainError::ResourceLimitExceeded { .. }) | Err(DomainError::InvalidDebArchive { .. })
+    ));
+
+    let mut raw_tar = Vec::new();
+    let mut long_hdr = [0u8; 512];
+    long_hdr[..10].copy_from_slice(b"././@LongL");
+    long_hdr[100..108].copy_from_slice(b"0000644\0");
+    long_hdr[108..116].copy_from_slice(b"0000000\0");
+    long_hdr[116..124].copy_from_slice(b"0000000\0");
+    long_hdr[124..136].copy_from_slice(b"01000000000\0");
+    long_hdr[136..148].copy_from_slice(b"14512345670\0");
+    long_hdr[148..156].fill(b' ');
+    long_hdr[156] = b'L';
+    long_hdr[257..263].copy_from_slice(b"ustar ");
+    let sum: u32 = long_hdr.iter().map(|&b| u32::from(b)).sum();
+    let chk = format!("{sum:06o}\0 ");
+    long_hdr[148..156].copy_from_slice(chk.as_bytes());
+    raw_tar.extend_from_slice(&long_hdr);
+    raw_tar.extend_from_slice(&[0u8; 1024]);
+    let mut gz = GzEncoder::new(Vec::new(), GzCompression::default());
+    gz.write_all(&raw_tar)?;
+    let gz_bytes = gz.finish()?;
+
+    let ext_deb = dir.path().join("ext_bomb.deb");
+    let mut f = File::create(&ext_deb)?;
+    f.write_all(b"!<arch>\n")?;
+    append_common_ar_member(&mut f, "debian-binary", b"2.0\n")?;
+    let ctrl_tar = build_compressed_tar(
+        &[SyntheticDebEntry {
+            path: "./control".to_string(),
+            entry_type: EntryType::Regular,
+            mode: 0o644,
+            mtime: 1_700_000_000,
+            data: b"Package: ext-bomb\nVersion: 1.0\nArchitecture: amd64\n".to_vec(),
+            link_target: None,
+        }],
+        TarCompression::Gzip,
+    )?;
+    append_common_ar_member(&mut f, "control.tar.gz", &ctrl_tar)?;
+    append_common_ar_member(&mut f, "data.tar.gz", &gz_bytes)?;
+
+    let ext_err = uc.execute(InstallPackageCommand {
+        source_path: ext_deb,
+        options: InstallOptions {
+            ignore_deps: true,
+            dry_run: true,
+            ..InstallOptions::default()
+        },
+    });
+    assert!(matches!(
+        ext_err,
+        Err(DomainError::InvalidDebArchive { .. })
+    ));
+
+    let forged_ar_deb = dir.path().join("forged_ar.deb");
+    let mut fa = File::create(&forged_ar_deb)?;
+    fa.write_all(b"!<arch>\n")?;
+    append_common_ar_member(&mut fa, "//", b"gnu-table")?;
+    assert!(matches!(
+        adapter.read_control_metadata(&forged_ar_deb),
+        Err(DomainError::InvalidDebArchive { .. })
+    ));
+
+    Ok(())
+}
+
+#[test]
+fn rejects_stager_parent_child_conflicts_root_dotfiles_non_utf8_and_normalizes_var_run()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let adapter = DebPackageAdapter::new();
+    let repo = FakeRepo(HashSet::new());
+    let pm = RecordingPackageManager {
+        installed: HashSet::new(),
+    };
+    let clock = FixedClock(1_700_000_000);
+    let inspectors: [&dyn SourcePackageInspectorPort; 1] = [&adapter];
+    let converters: [&dyn ArchPackageConverterPort; 1] = [&adapter];
+    let uc = InstallPackageUseCase::new(&inspectors, &converters, &repo, &pm, &clock);
+
+    let sym_parent_deb = dir.path().join("sym_parent.deb");
+    build_deb_from_entries(
+        &sym_parent_deb,
+        "sym-parent",
+        &[
+            SyntheticDebEntry {
+                path: "./usr/bin".to_string(),
+                entry_type: EntryType::Symlink,
+                mode: 0o777,
+                mtime: 1_700_000_000,
+                data: Vec::new(),
+                link_target: Some("/etc".to_string()),
+            },
+            SyntheticDebEntry {
+                path: "./bin/tool".to_string(),
+                entry_type: EntryType::Regular,
+                mode: 0o755,
+                mtime: 1_700_000_000,
+                data: b"pwn".to_vec(),
+                link_target: None,
+            },
+        ],
+    )?;
+    assert!(matches!(
+        uc.execute(InstallPackageCommand {
+            source_path: sym_parent_deb,
+            options: InstallOptions {
+                ignore_deps: true,
+                dry_run: true,
+                ..InstallOptions::default()
+            },
+        }),
+        Err(DomainError::InvalidDebArchive { .. })
+    ));
+
+    let dir_override_deb = dir.path().join("dir_override.deb");
+    build_deb_from_entries(
+        &dir_override_deb,
+        "dir-override",
+        &[
+            SyntheticDebEntry {
+                path: "./bin/foo/".to_string(),
+                entry_type: EntryType::Directory,
+                mode: 0o755,
+                mtime: 1_700_000_000,
+                data: Vec::new(),
+                link_target: None,
+            },
+            SyntheticDebEntry {
+                path: "./usr/bin/foo".to_string(),
+                entry_type: EntryType::Regular,
+                mode: 0o755,
+                mtime: 1_700_000_000,
+                data: b"conflict".to_vec(),
+                link_target: None,
+            },
+        ],
+    )?;
+    assert!(matches!(
+        uc.execute(InstallPackageCommand {
+            source_path: dir_override_deb,
+            options: InstallOptions {
+                ignore_deps: true,
+                dry_run: true,
+                ..InstallOptions::default()
+            },
+        }),
+        Err(DomainError::InvalidDebArchive { .. })
+    ));
+
+    let dotfile_deb = dir.path().join("root_dot.deb");
+    build_deb_from_entries(
+        &dotfile_deb,
+        "root-dot",
+        &[SyntheticDebEntry {
+            path: "./.bashrc".to_string(),
+            entry_type: EntryType::Regular,
+            mode: 0o644,
+            mtime: 1_700_000_000,
+            data: b"echo evil".to_vec(),
+            link_target: None,
+        }],
+    )?;
+    assert!(matches!(
+        uc.execute(InstallPackageCommand {
+            source_path: dotfile_deb,
+            options: InstallOptions {
+                ignore_deps: true,
+                dry_run: true,
+                ..InstallOptions::default()
+            },
+        }),
+        Err(DomainError::UnsafePathTraversal(_))
+    ));
+
+    let var_run_deb = dir.path().join("var_run.deb");
+    let out_dir = dir.path().join("var_run_out");
+    build_deb_from_entries(
+        &var_run_deb,
+        "var-run-app",
+        &[
+            SyntheticDebEntry {
+                path: "./var/run/".to_string(),
+                entry_type: EntryType::Directory,
+                mode: 0o755,
+                mtime: 1_700_000_000,
+                data: Vec::new(),
+                link_target: None,
+            },
+            SyntheticDebEntry {
+                path: "./var/run/app.pid".to_string(),
+                entry_type: EntryType::Regular,
+                mode: 0o644,
+                mtime: 1_700_000_000,
+                data: b"123".to_vec(),
+                link_target: None,
+            },
+            SyntheticDebEntry {
+                path: "./var/lock/app.lock".to_string(),
+                entry_type: EntryType::Regular,
+                mode: 0o644,
+                mtime: 1_700_000_000,
+                data: b"lock".to_vec(),
+                link_target: None,
+            },
+        ],
+    )?;
+    let var_out = uc.execute(InstallPackageCommand {
+        source_path: var_run_deb,
+        options: InstallOptions {
+            ignore_deps: true,
+            dry_run: true,
+            keep_pkg_dir: Some(out_dir),
+            ..InstallOptions::default()
+        },
+    })?;
+    let pkg_path = var_out.kept_package_path.ok_or("missing var_run pkg")?;
+    let mut pkg_tar = Archive::new(ZstdDecoder::new(File::open(&pkg_path)?)?);
+    let mut paths = HashSet::new();
+    for entry_res in pkg_tar.entries()? {
+        let entry = entry_res?;
+        paths.insert(entry.path()?.to_string_lossy().into_owned());
+    }
+    assert!(paths.contains("run/app.pid"));
+    assert!(paths.contains("run/lock/app.lock"));
+    assert!(!paths.contains("var/run/app.pid"));
+    assert!(!paths.contains("var/lock/app.lock"));
+
+    let mut non_utf8_hdr = [0u8; 512];
+    let bad_path = b"usr/bin/\xffbad";
+    non_utf8_hdr[..bad_path.len()].copy_from_slice(bad_path);
+    non_utf8_hdr[100..108].copy_from_slice(b"0000755\0");
+    non_utf8_hdr[108..116].copy_from_slice(b"0000000\0");
+    non_utf8_hdr[116..124].copy_from_slice(b"0000000\0");
+    non_utf8_hdr[124..136].copy_from_slice(b"00000000000\0");
+    non_utf8_hdr[136..148].copy_from_slice(b"14512345670\0");
+    non_utf8_hdr[148..156].fill(b' ');
+    non_utf8_hdr[156] = b'0';
+    non_utf8_hdr[257..263].copy_from_slice(b"ustar ");
+    let non_utf8_sum: u32 = non_utf8_hdr.iter().map(|&b| u32::from(b)).sum();
+    let non_utf8_chk = format!("{non_utf8_sum:06o}\0 ");
+    non_utf8_hdr[148..156].copy_from_slice(non_utf8_chk.as_bytes());
+    let mut non_utf8_tar = Vec::new();
+    non_utf8_tar.extend_from_slice(&non_utf8_hdr);
+    non_utf8_tar.extend_from_slice(&[0u8; 1024]);
+    let mut non_utf8_gz = GzEncoder::new(Vec::new(), GzCompression::default());
+    non_utf8_gz.write_all(&non_utf8_tar)?;
+    let non_utf8_gz_bytes = non_utf8_gz.finish()?;
+
+    let non_utf8_deb = dir.path().join("non_utf8.deb");
+    let mut nu_file = File::create(&non_utf8_deb)?;
+    nu_file.write_all(b"!<arch>\n")?;
+    append_common_ar_member(&mut nu_file, "debian-binary", b"2.0\n")?;
+    let nu_ctrl = build_compressed_tar(
+        &[SyntheticDebEntry {
+            path: "./control".to_string(),
+            entry_type: EntryType::Regular,
+            mode: 0o644,
+            mtime: 1_700_000_000,
+            data: b"Package: non-utf8-app\nVersion: 1.0\nArchitecture: amd64\n".to_vec(),
+            link_target: None,
+        }],
+        TarCompression::Gzip,
+    )?;
+    append_common_ar_member(&mut nu_file, "control.tar.gz", &nu_ctrl)?;
+    append_common_ar_member(&mut nu_file, "data.tar.gz", &non_utf8_gz_bytes)?;
+
+    let nu_err = uc.execute(InstallPackageCommand {
+        source_path: non_utf8_deb,
+        options: InstallOptions {
+            ignore_deps: true,
+            dry_run: true,
+            ..InstallOptions::default()
+        },
+    });
+    match nu_err {
+        Err(DomainError::InvalidDebArchive { reason, .. }) => {
+            assert!(
+                reason.contains("non-UTF8"),
+                "expected non-UTF8 rejection, got: {reason}"
+            );
+        }
+        other => return Err(format!("expected InvalidDebArchive, got {other:?}").into()),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn rejects_oversized_xz_dictionary_beyond_memlimit() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let adapter = DebPackageAdapter::new();
+    let repo = FakeRepo(HashSet::new());
+    let pm = RecordingPackageManager {
+        installed: HashSet::new(),
+    };
+    let clock = FixedClock(1_700_000_000);
+    let inspectors: [&dyn SourcePackageInspectorPort; 1] = [&adapter];
+    let converters: [&dyn ArchPackageConverterPort; 1] = [&adapter];
+    let uc = InstallPackageUseCase::new(&inspectors, &converters, &repo, &pm, &clock);
+
+    let mut xz_enc = XzEncoder::new(Vec::new(), 1);
+    xz_enc.write_all(b"placeholder")?;
+    let mut xz_bytes = xz_enc.finish()?;
+    assert!(xz_bytes.len() >= 24);
+    assert_eq!(xz_bytes[12], 0x02);
+    assert_eq!(xz_bytes[14], 0x21);
+    assert_eq!(xz_bytes[15], 0x01);
+    xz_bytes[16] = 0x22;
+    let mut crc = FlateCrc::new();
+    crc.update(&xz_bytes[12..20]);
+    xz_bytes[20..24].copy_from_slice(&crc.sum().to_le_bytes());
+
+    let xz_deb = dir.path().join("xz_memlimit.deb");
+    let mut xf = File::create(&xz_deb)?;
+    xf.write_all(b"!<arch>\n")?;
+    append_common_ar_member(&mut xf, "debian-binary", b"2.0\n")?;
+    let ctrl = build_compressed_tar(
+        &[SyntheticDebEntry {
+            path: "./control".to_string(),
+            entry_type: EntryType::Regular,
+            mode: 0o644,
+            mtime: 1_700_000_000,
+            data: b"Package: xz-memlimit\nVersion: 1.0\nArchitecture: amd64\n".to_vec(),
+            link_target: None,
+        }],
+        TarCompression::Gzip,
+    )?;
+    append_common_ar_member(&mut xf, "control.tar.gz", &ctrl)?;
+    append_common_ar_member(&mut xf, "data.tar.xz", &xz_bytes)?;
+
+    let err = uc.execute(InstallPackageCommand {
+        source_path: xz_deb,
+        options: InstallOptions {
+            ignore_deps: true,
+            dry_run: true,
+            ..InstallOptions::default()
+        },
+    });
+    match err {
+        Err(DomainError::InvalidDebArchive { reason, .. }) => {
+            assert!(
+                reason.to_ascii_lowercase().contains("memory limit"),
+                "expected XZ memory limit rejection, got: {reason}"
+            );
+        }
+        other => return Err(format!("expected InvalidDebArchive, got {other:?}").into()),
+    }
 
     Ok(())
 }

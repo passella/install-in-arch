@@ -1,4 +1,5 @@
 use crate::domain::error::DomainError;
+use crate::domain::sanitizer::{is_bidi_or_invisible_format, sanitize_for_error};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NormalizedPayloadAction {
@@ -28,7 +29,13 @@ pub fn normalize_payload_path(
     }
 
     if is_reserved_pacman_metadata(&clean) {
-        return Err(DomainError::ReservedPackageMetadataPath(raw.to_string()));
+        return Err(DomainError::ReservedPackageMetadataPath(
+            sanitize_for_error(raw),
+        ));
+    }
+
+    if clean.starts_with('.') {
+        return Err(DomainError::UnsafePathTraversal(sanitize_for_error(raw)));
     }
 
     if let Some(target_dir) = conflicting_usr_merge_root(&clean) {
@@ -39,7 +46,7 @@ pub fn normalize_payload_path(
         if is_symlink {
             return Ok(NormalizedPayloadAction::Skip);
         }
-        return Err(DomainError::UnsafePathTraversal(raw.to_string()));
+        return Err(DomainError::UnsafePathTraversal(sanitize_for_error(raw)));
     }
 
     let (remapped, parents) = apply_usr_merge_prefix(&clean);
@@ -54,10 +61,12 @@ pub fn normalize_payload_path(
 pub fn normalize_hardlink_target(raw: &str) -> Result<String, DomainError> {
     let clean = strip_and_validate_components(raw)?;
     if is_reserved_pacman_metadata(&clean) {
-        return Err(DomainError::ReservedPackageMetadataPath(raw.to_string()));
+        return Err(DomainError::ReservedPackageMetadataPath(
+            sanitize_for_error(raw),
+        ));
     }
-    if clean.is_empty() || conflicting_usr_merge_root(&clean).is_some() {
-        return Err(DomainError::UnsafePathTraversal(raw.to_string()));
+    if clean.is_empty() || clean.starts_with('.') || conflicting_usr_merge_root(&clean).is_some() {
+        return Err(DomainError::UnsafePathTraversal(sanitize_for_error(raw)));
     }
     let (remapped, _) = apply_usr_merge_prefix(&clean);
     Ok(remapped)
@@ -67,9 +76,15 @@ pub fn normalize_symlink_target(
     raw_entry_path: &str,
     archive_path: &str,
     raw_target: &str,
-) -> SymlinkResolution {
+) -> Result<SymlinkResolution, DomainError> {
+    if has_unsafe_path_chars(raw_target) {
+        return Err(DomainError::UnsafePathTraversal(sanitize_for_error(
+            raw_target,
+        )));
+    }
+
     if raw_target.is_empty() {
-        return SymlinkResolution::Keep(String::new());
+        return Ok(SymlinkResolution::Keep(String::new()));
     }
 
     let clean_entry = strip_and_validate_components(raw_entry_path).unwrap_or_default();
@@ -77,17 +92,17 @@ pub fn normalize_symlink_target(
 
     if raw_target.starts_with('/') {
         let Some(resolved_abs) = resolve_relative_segments(&[], raw_target) else {
-            return SymlinkResolution::Keep(raw_target.to_string());
+            return Ok(SymlinkResolution::Keep(raw_target.to_string()));
         };
         let abs_joined = resolved_abs.join("/");
         let (remapped_target, _) = apply_usr_merge_prefix(&abs_joined);
         if remapped_target == archive_path {
-            return SymlinkResolution::DiscardSelfReferential;
+            return Ok(SymlinkResolution::DiscardSelfReferential);
         }
         if remapped_target != abs_joined {
-            return SymlinkResolution::Keep(format!("/{remapped_target}"));
+            return Ok(SymlinkResolution::Keep(format!("/{remapped_target}")));
         }
-        return SymlinkResolution::Keep(raw_target.to_string());
+        return Ok(SymlinkResolution::Keep(raw_target.to_string()));
     }
 
     let old_parent: Vec<&str> = clean_entry
@@ -96,18 +111,18 @@ pub fn normalize_symlink_target(
         .unwrap_or_default();
 
     let Some(resolved_old) = resolve_relative_segments(&old_parent, raw_target) else {
-        return SymlinkResolution::Keep(raw_target.to_string());
+        return Ok(SymlinkResolution::Keep(raw_target.to_string()));
     };
 
     let resolved_old_joined = resolved_old.join("/");
     let (remapped_target, _) = apply_usr_merge_prefix(&resolved_old_joined);
     if remapped_target == archive_path {
-        return SymlinkResolution::DiscardSelfReferential;
+        return Ok(SymlinkResolution::DiscardSelfReferential);
     }
 
     let target_was_usr_merged = remapped_target != resolved_old_joined;
     if !source_was_usr_merged && !target_was_usr_merged {
-        return SymlinkResolution::Keep(raw_target.to_string());
+        return Ok(SymlinkResolution::Keep(raw_target.to_string()));
     }
 
     let new_parent: Vec<&str> = archive_path
@@ -131,9 +146,9 @@ pub fn normalize_symlink_target(
     }
 
     if rel_parts.is_empty() {
-        SymlinkResolution::Keep(".".to_string())
+        Ok(SymlinkResolution::Keep(".".to_string()))
     } else {
-        SymlinkResolution::Keep(rel_parts.join("/"))
+        Ok(SymlinkResolution::Keep(rel_parts.join("/")))
     }
 }
 
@@ -141,7 +156,7 @@ pub fn is_conflicting_arch_path(path: &str) -> bool {
     let trimmed = path.trim_matches('/');
     matches!(
         trimmed,
-        "bin" | "sbin" | "lib" | "lib64" | "usr/sbin" | "usr/lib64"
+        "bin" | "sbin" | "lib" | "lib64" | "usr/sbin" | "usr/lib64" | "var/run" | "var/lock"
     )
 }
 
@@ -150,6 +165,11 @@ pub fn is_reserved_pacman_metadata(clean_path: &str) -> bool {
         clean_path,
         ".PKGINFO" | ".MTREE" | ".BUILDINFO" | ".INSTALL" | ".CHANGELOG"
     )
+}
+
+fn has_unsafe_path_chars(raw: &str) -> bool {
+    raw.chars()
+        .any(|ch| ch == '\0' || ch.is_control() || is_bidi_or_invisible_format(ch))
 }
 
 fn resolve_relative_segments<'a>(base: &[&'a str], target: &'a str) -> Option<Vec<&'a str>> {
@@ -167,11 +187,14 @@ fn resolve_relative_segments<'a>(base: &[&'a str], target: &'a str) -> Option<Ve
 }
 
 fn strip_and_validate_components(raw: &str) -> Result<String, DomainError> {
+    if has_unsafe_path_chars(raw) {
+        return Err(DomainError::UnsafePathTraversal(sanitize_for_error(raw)));
+    }
     let mut parts = Vec::new();
     for segment in raw.split('/') {
         match segment {
             "" | "." => {}
-            ".." => return Err(DomainError::UnsafePathTraversal(raw.to_string())),
+            ".." => return Err(DomainError::UnsafePathTraversal(sanitize_for_error(raw))),
             valid => parts.push(valid),
         }
     }
@@ -182,6 +205,8 @@ fn conflicting_usr_merge_root(clean: &str) -> Option<&'static str> {
     match clean {
         "bin" | "sbin" | "usr/sbin" => Some("usr/bin"),
         "lib" | "lib64" | "usr/lib64" => Some("usr/lib"),
+        "var/run" => Some("run"),
+        "var/lock" => Some("run/lock"),
         _ => None,
     }
 }
@@ -190,18 +215,22 @@ fn usr_merge_parents_for_dir(target_dir: &str) -> Vec<String> {
     match target_dir {
         "usr/bin" => vec!["usr".to_string(), "usr/bin".to_string()],
         "usr/lib" => vec!["usr".to_string(), "usr/lib".to_string()],
+        "run" => vec!["run".to_string()],
+        "run/lock" => vec!["run".to_string(), "run/lock".to_string()],
         _ => Vec::new(),
     }
 }
 
 fn apply_usr_merge_prefix(clean: &str) -> (String, Vec<String>) {
-    let mappings: [(&str, &str); 6] = [
+    let mappings: [(&str, &str); 8] = [
         ("bin/", "usr/bin/"),
         ("sbin/", "usr/bin/"),
         ("usr/sbin/", "usr/bin/"),
         ("lib/", "usr/lib/"),
         ("lib64/", "usr/lib/"),
         ("usr/lib64/", "usr/lib/"),
+        ("var/run/", "run/"),
+        ("var/lock/", "run/lock/"),
     ];
 
     for (from_prefix, to_prefix) in mappings {
@@ -231,10 +260,14 @@ mod tests {
         assert!(normalize_payload_path("./usr/../etc/passwd", false, false).is_err());
         assert!(normalize_payload_path("../secret", false, false).is_err());
         assert!(normalize_hardlink_target("usr/bin/../../bin/sh").is_err());
+        assert!(normalize_payload_path("./usr/bin/evil\0name", false, false).is_err());
+        assert!(normalize_payload_path("./usr/bin/evil\x1b[31m", false, false).is_err());
+        assert!(normalize_payload_path("./usr/bin/evil\u{202E}name", false, false).is_err());
+        assert!(normalize_symlink_target("./usr/bin/l", "usr/bin/l", "bad\0target").is_err());
     }
 
     #[test]
-    fn rejects_reserved_pacman_metadata_files_at_payload_root() {
+    fn rejects_reserved_pacman_metadata_files_and_arbitrary_root_dotfiles() {
         for reserved in [
             "./.PKGINFO",
             ".MTREE",
@@ -256,7 +289,20 @@ mod tests {
             ));
         }
 
+        for root_dot in [
+            "./.bashrc",
+            ".FILELIST",
+            "/.ssh/authorized_keys",
+            ".git/config",
+        ] {
+            assert!(matches!(
+                normalize_payload_path(root_dot, false, false),
+                Err(DomainError::UnsafePathTraversal(_))
+            ));
+        }
+
         assert!(normalize_payload_path("./usr/share/doc/.PKGINFO", false, false).is_ok());
+        assert!(normalize_payload_path("./etc/skel/.bashrc", false, false).is_ok());
     }
 
     #[test]
@@ -273,10 +319,18 @@ mod tests {
             normalize_payload_path("/usr/sbin", false, true),
             Ok(NormalizedPayloadAction::Skip)
         );
+        assert_eq!(
+            normalize_payload_path("./var/run", false, true),
+            Ok(NormalizedPayloadAction::Skip)
+        );
+        assert_eq!(
+            normalize_payload_path("/var/lock", false, true),
+            Ok(NormalizedPayloadAction::Skip)
+        );
     }
 
     #[test]
-    fn conflicting_usr_merge_directories_ensure_canonical_parents_only() {
+    fn conflicting_usr_merge_and_var_run_directories_ensure_canonical_parents_only() {
         assert_eq!(
             normalize_payload_path("./bin/", true, false),
             Ok(NormalizedPayloadAction::EnsureDirsOnly(vec![
@@ -291,17 +345,32 @@ mod tests {
                 "usr/lib".to_string()
             ]))
         );
+        assert_eq!(
+            normalize_payload_path("/var/run/", true, false),
+            Ok(NormalizedPayloadAction::EnsureDirsOnly(vec![
+                "run".to_string()
+            ]))
+        );
+        assert_eq!(
+            normalize_payload_path("./var/lock/", true, false),
+            Ok(NormalizedPayloadAction::EnsureDirsOnly(vec![
+                "run".to_string(),
+                "run/lock".to_string()
+            ]))
+        );
         assert!(is_conflicting_arch_path("bin"));
         assert!(is_conflicting_arch_path("sbin"));
         assert!(is_conflicting_arch_path("lib"));
         assert!(is_conflicting_arch_path("lib64"));
         assert!(is_conflicting_arch_path("usr/sbin"));
         assert!(is_conflicting_arch_path("usr/lib64"));
+        assert!(is_conflicting_arch_path("var/run"));
+        assert!(is_conflicting_arch_path("var/lock"));
         assert!(!is_conflicting_arch_path("usr/bin"));
     }
 
     #[test]
-    fn remaps_all_six_usr_merge_prefixes_and_preserves_nested_app_bin() {
+    fn remaps_all_usr_merge_and_var_run_prefixes_and_preserves_nested_app_bin() {
         let cases = [
             ("./bin/tool", "usr/bin/tool", vec!["usr", "usr/bin"]),
             (
@@ -320,6 +389,12 @@ mod tests {
                 "usr/lib64/libb.so",
                 "usr/lib/libb.so",
                 vec!["usr", "usr/lib"],
+            ),
+            ("./var/run/daemon.pid", "run/daemon.pid", vec!["run"]),
+            (
+                "/var/lock/subsys/app",
+                "run/lock/subsys/app",
+                vec!["run", "run/lock"],
             ),
         ];
 
@@ -358,29 +433,33 @@ mod tests {
             normalize_hardlink_target("/usr/lib64/libfoo.so.1"),
             Ok("usr/lib/libfoo.so.1".to_string())
         );
+        assert_eq!(
+            normalize_hardlink_target("/var/run/app.sock"),
+            Ok("run/app.sock".to_string())
+        );
     }
 
     #[test]
     fn readjusts_relative_symlinks_moved_by_usr_merge_and_discards_self_referential() {
         assert_eq!(
             normalize_symlink_target("./bin/foo", "usr/bin/foo", "../usr/lib/bar"),
-            SymlinkResolution::Keep("../lib/bar".to_string())
+            Ok(SymlinkResolution::Keep("../lib/bar".to_string()))
         );
         assert_eq!(
             normalize_symlink_target("./bin/foo", "usr/bin/foo", "../opt/app/run"),
-            SymlinkResolution::Keep("../../opt/app/run".to_string())
+            Ok(SymlinkResolution::Keep("../../opt/app/run".to_string()))
         );
         assert_eq!(
             normalize_symlink_target("./bin/foo", "usr/bin/foo", "foo-real"),
-            SymlinkResolution::Keep("foo-real".to_string())
+            Ok(SymlinkResolution::Keep("foo-real".to_string()))
         );
         assert_eq!(
             normalize_symlink_target("./bin/foo", "usr/bin/foo", "../usr/bin/foo"),
-            SymlinkResolution::DiscardSelfReferential
+            Ok(SymlinkResolution::DiscardSelfReferential)
         );
         assert_eq!(
             normalize_symlink_target("./usr/lib/libx.so", "usr/lib/libx.so", "/lib/libx.so"),
-            SymlinkResolution::DiscardSelfReferential
+            Ok(SymlinkResolution::DiscardSelfReferential)
         );
         assert_eq!(
             normalize_symlink_target(
@@ -388,7 +467,9 @@ mod tests {
                 "usr/bin/epic launcher",
                 "../../opt/Epic Games/chrome-sandbox"
             ),
-            SymlinkResolution::Keep("../../opt/Epic Games/chrome-sandbox".to_string())
+            Ok(SymlinkResolution::Keep(
+                "../../opt/Epic Games/chrome-sandbox".to_string()
+            ))
         );
     }
 }

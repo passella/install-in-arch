@@ -17,6 +17,15 @@ ignore = []
 multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
+skip = [
+    { crate = "block-buffer@0.10", reason = "Transitive duplicate pulled by rpm 0.30.2" },
+    { crate = "cpufeatures@0.2", reason = "Transitive duplicate pulled by rpm 0.30.2" },
+    { crate = "crypto-common@0.1", reason = "Transitive duplicate pulled by rpm 0.30.2" },
+    { crate = "digest@0.10", reason = "Transitive duplicate pulled by rpm 0.30.2" },
+    { crate = "sha2@0.10", reason = "Transitive duplicate pulled by rpm 0.30.2" },
+    { crate = "syn@1", reason = "Transitive duplicate pulled by rpm 0.30.2 proc-macro dependencies" },
+    { crate = "syn@2", reason = "Transitive duplicate pulled by rpm 0.30.2 proc-macro dependencies" },
+]
 
 [sources]
 unknown-registry = "deny"

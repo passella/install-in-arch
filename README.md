@@ -1,5 +1,7 @@
 # install-in-arch
 
+🌐 **Português (Brasil)** | [English](README.en.md) | [Español](README.es.md) | [简体中文](README.zh-CN.md)
+
 Conversor nativo e gerenciador de pacotes **`.deb` / `.rpm` → `.pkg.tar.zst`** escrito em **Rust** (Edition 2024) para **Arch Linux** e distribuições derivadas baseadas no `pacman`.
 
 O `install-in-arch` lê pacotes Debian (`.deb`) e RPM (`.rpm`) diretamente em *streaming*, resolve dependências contra os repositórios configurados no `pacman`, aplica normalização *usr-merge*, gera metadados `.PKGINFO` e `.MTREE` v2 íntegros e delega a instalação, listagem e desinstalação de forma segura ao `pacman`.

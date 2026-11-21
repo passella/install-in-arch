@@ -52,6 +52,36 @@ Native **`.deb` / `.rpm` / `.apk` → `.pkg.tar.zst`** package converter and man
 - **Privileges:** `sudo` configured (when run by a regular user, `install-in-arch` invokes `sudo pacman ...`; when run as `root`, it invokes `pacman` directly).
 - **Rust toolchain:** `rustc` and `cargo` with **Rust Edition 2024** support (only required when building from source).
 
+### Automated Install & Uninstall (`install.sh` / `uninstall.sh`)
+
+The repository provides [`install.sh`](install.sh) and [`uninstall.sh`](uninstall.sh) for automated installation and removal with mandatory SHA-256 verification against the release `SHA256SUMS.txt` (always over HTTPS with TLS $\ge$ 1.2):
+
+```bash
+# Automatic install (uses pacman -U on Arch x86_64, or the static musl tarball in ~/.local / aarch64)
+curl -fsSL https://raw.githubusercontent.com/passella/install-in-arch/master/install.sh | bash
+
+# Or download, inspect, and run locally (pass -y for pacman --noconfirm):
+curl -fsSLO https://raw.githubusercontent.com/passella/install-in-arch/master/install.sh
+chmod +x install.sh
+./install.sh -y
+```
+
+Available `install.sh` options:
+
+- `--version <vX.Y.Z|X.Y.Z>`: installs a specific release version instead of the latest one.
+- `--method <auto|pacman|tarball>`: selects the installation method (`auto` uses `pacman -U` with `.pkg.tar.zst` when `pacman` is available, the architecture is `x86_64`, and `--prefix` is not set; otherwise it installs the static `.tar.gz` archive containing the binary, Bash/Zsh/Fish completions, `install-in-arch.1.gz` man page, `README.md`, and licenses).
+- `--prefix <DIR>`: target prefix for tarball mode (default: `~/.local` for non-root, `/usr/local` for `root`; implies tarball mode under `auto`).
+- `-y`, `--yes`: passes `--noconfirm` to `pacman`.
+
+To uninstall (removes the `pacman` package if present, plus tarball files from `~/.local`, `/usr/local`, or `--prefix`):
+
+```bash
+./uninstall.sh
+# or non-interactive pacman removal / custom prefix:
+./uninstall.sh -y
+./uninstall.sh --prefix ~/.local
+```
+
 ### Quick Install via Native Arch Package, Pre-built Binary (Release), or AUR
 
 The [Releases](https://github.com/passella/install-in-arch/releases/latest) page publishes the following artifacts (all covered by `SHA256SUMS.txt` and build provenance attestation):

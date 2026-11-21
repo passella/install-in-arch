@@ -52,6 +52,36 @@
 - **权限要求：** 已配置 `sudo`（由普通用户执行时，`install-in-arch` 会调用 `sudo pacman ...`；以 `root` 身份执行时，则直接调用 `pacman`）。
 - **Rust 工具链：** 支持 **Rust Edition 2024** 的 `rustc` 和 `cargo`（仅在从源码编译时需要）。
 
+### 自动安装与卸载（`install.sh` / `uninstall.sh`）
+
+仓库提供了 [`install.sh`](install.sh) 和 [`uninstall.sh`](uninstall.sh) 脚本，用于自动完成安装与卸载，并在安装前强制依据对应 Release 的 `SHA256SUMS.txt` 执行 SHA-256 校验（全程仅使用 TLS $\ge$ 1.2 的 HTTPS）：
+
+```bash
+# 自动安装（在 Arch x86_64 上使用 pacman -U，在 ~/.local 或 aarch64 上使用静态 musl 压缩包）
+curl -fsSL https://raw.githubusercontent.com/passella/install-in-arch/master/install.sh | bash
+
+# 或先下载、检查后再本地运行（传入 -y 可向 pacman 传递 --noconfirm）：
+curl -fsSLO https://raw.githubusercontent.com/passella/install-in-arch/master/install.sh
+chmod +x install.sh
+./install.sh -y
+```
+
+`install.sh` 常用选项：
+
+- `--version <vX.Y.Z|X.Y.Z>`：安装指定版本而非最新版本。
+- `--method <auto|pacman|tarball>`：指定安装方式（`auto` 会在存在 `pacman`、架构为 `x86_64` 且未指定 `--prefix` 时使用 `.pkg.tar.zst` 与 `pacman -U`；否则安装包含二进制文件、Bash/Zsh/Fish 自动补全、`install-in-arch.1.gz` 手册页、`README.md` 与许可证的静态 `.tar.gz` 归档）。
+- `--prefix <DIR>`：指定 tarball 模式的目标安装前缀（普通用户默认 `~/.local`，`root` 默认 `/usr/local`；在 `auto` 模式下指定该参数会自动切换为 tarball 模式）。
+- `-y`, `--yes`：向 `pacman` 传递 `--noconfirm`。
+
+卸载（会移除已安装的 `pacman` 软件包，以及 `~/.local`、`/usr/local` 或 `--prefix` 中的 tarball 安装文件）：
+
+```bash
+./uninstall.sh
+# 或非交互式移除 pacman 软件包 / 仅卸载指定前缀：
+./uninstall.sh -y
+./uninstall.sh --prefix ~/.local
+```
+
 ### 通过原生 Arch 软件包、预编译二进制文件（Release）或 AUR 快速安装
 
 [Releases](https://github.com/passella/install-in-arch/releases/latest) 页面发布以下产物（均包含在 `SHA256SUMS.txt` 与构建来源证明中）：

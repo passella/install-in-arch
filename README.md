@@ -52,6 +52,36 @@ O `install-in-arch` lê pacotes Debian (`.deb`), RPM (`.rpm`) e Alpine Linux (`.
 - **Privilégios:** `sudo` configurado (quando executado por usuário comum, o `install-in-arch` invoca `sudo pacman ...`; quando executado como `root`, invoca `pacman` diretamente).
 - **Toolchain Rust:** `rustc` e `cargo` com suporte à **Rust Edition 2024** (apenas para compilação a partir do código-fonte).
 
+### Instalação automática (`install.sh` / `uninstall.sh`)
+
+O repositório fornece os scripts [`install.sh`](install.sh) e [`uninstall.sh`](uninstall.sh) para instalação e remoção automatizadas com verificação obrigatória de integridade SHA-256 contra o `SHA256SUMS.txt` da respectiva Release (sempre via HTTPS com TLS $\ge$ 1.2):
+
+```bash
+# Instalação automática (usa pacman -U em Arch x86_64 ou tarball musl estático em ~/.local / aarch64)
+curl -fsSL https://raw.githubusercontent.com/passella/install-in-arch/master/install.sh | bash
+
+# Ou baixe, inspecione e execute localmente (com -y para passar --noconfirm ao pacman):
+curl -fsSLO https://raw.githubusercontent.com/passella/install-in-arch/master/install.sh
+chmod +x install.sh
+./install.sh -y
+```
+
+Opções úteis do `install.sh`:
+
+- `--version <vX.Y.Z|X.Y.Z>`: instala uma versão específica em vez da mais recente.
+- `--method <auto|pacman|tarball>`: força o método de instalação (`auto` usa `pacman -U` com `.pkg.tar.zst` quando `pacman` está disponível, a arquitetura é `x86_64` e `--prefix` não foi informado; caso contrário instala o `.tar.gz` estático com binário, autocompletar Bash/Zsh/Fish, man page `install-in-arch.1.gz`, `README.md` e licenças).
+- `--prefix <DIR>`: define o prefixo de destino no modo tarball (padrão: `~/.local` para usuário comum, `/usr/local` para `root`; implica `--method tarball` no modo `auto`).
+- `-y`, `--yes`: passa `--noconfirm` ao `pacman`.
+
+Para desinstalar (remove o pacote `pacman`, caso instalado, e os arquivos do tarball em `~/.local`, `/usr/local` ou `--prefix`):
+
+```bash
+./uninstall.sh
+# ou com remoção não interativa via pacman / prefixo específico:
+./uninstall.sh -y
+./uninstall.sh --prefix ~/.local
+```
+
 ### Instalação rápida via pacote nativo Arch, binário pré-compilado (Release) ou AUR
 
 Na página de [Releases](https://github.com/passella/install-in-arch/releases/latest) são publicados os seguintes artefatos (todos cobertos por `SHA256SUMS.txt` e atestação de proveniência de build):

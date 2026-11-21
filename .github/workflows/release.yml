@@ -297,7 +297,7 @@ jobs:
           pacman -Qkk install-in-arch-smoke-deb
           pacman -R --noconfirm install-in-arch-smoke-deb
 
-          rm -rf /tmp/self_deb pkg_dist
+          rm -rf /tmp/self_deb /tmp/self_pkg_out pkg_dist
           mkdir -p \
             /tmp/self_deb/ctrl \
             /tmp/self_deb/data/usr/bin \
@@ -307,6 +307,7 @@ jobs:
             /tmp/self_deb/data/usr/share/zsh/site-functions \
             /tmp/self_deb/data/usr/share/fish/vendor_completions.d \
             /tmp/self_deb/data/usr/share/man/man1 \
+            /tmp/self_pkg_out \
             pkg_dist
           printf '2.0\n' > /tmp/self_deb/debian-binary
           printf 'Package: install-in-arch\nVersion: %s\nArchitecture: amd64\nHomepage: https://github.com/passella/install-in-arch\nLicense: MIT OR Apache-2.0\nDescription: Native converter and package manager (.deb / .rpm / .apk -> .pkg.tar.zst) in Rust for Arch Linux\n' "${PKG_VER}" > /tmp/self_deb/ctrl/control
@@ -322,8 +323,8 @@ jobs:
           tar -czf /tmp/self_deb/data.tar.gz -C /tmp/self_deb/data usr
           bsdtar --format=arsvr4 -cf /tmp/self_deb/install-in-arch.deb -C /tmp/self_deb debian-binary control.tar.gz data.tar.gz
 
-          /tmp/smoke_tar/install-in-arch --dry-run --ignore-deps --keep-pkg pkg_dist /tmp/self_deb/install-in-arch.deb
-          SELF_PKG="pkg_dist/install-in-arch-${PKG_VER}-1-x86_64.pkg.tar.zst"
+          /tmp/smoke_tar/install-in-arch --dry-run --ignore-deps --keep-pkg /tmp/self_pkg_out /tmp/self_deb/install-in-arch.deb
+          SELF_PKG="/tmp/self_pkg_out/install-in-arch-${PKG_VER}-1-x86_64.pkg.tar.zst"
           test -f "${SELF_PKG}"
           pacman -Qpi "${SELF_PKG}"
           pacman -Qpi "${SELF_PKG}" | grep -q 'MIT OR Apache-2.0'
@@ -333,11 +334,13 @@ jobs:
           pacman -Qkk install-in-arch
           /usr/bin/install-in-arch --version
           pacman -R --noconfirm install-in-arch
+          install -m 0644 "${SELF_PKG}" pkg_dist/
+          rm -rf /tmp/self_pkg_out /tmp/self_deb
 
       - name: Validate synthetic .rpm and .apk against real pacman
         run: |
           set -euo pipefail
-          if [ ! -d /etc/pacman.d/gnupg ]; then
+          if [ ! -r /etc/pacman.d/gnupg/pubring.gpg ] || [ ! -r /etc/pacman.d/gnupg/trustdb.gpg ] || ! gpg --homedir /etc/pacman.d/gnupg --with-colons --list-secret-keys 2>/dev/null | grep '^sec:' >/dev/null; then
             pacman-key --init
             pacman-key --populate archlinux
           fi

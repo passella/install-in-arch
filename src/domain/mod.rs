@@ -1,4 +1,5 @@
 pub mod control_parser;
+pub mod dependency_catalog;
 pub mod dependency_resolver;
 pub mod error;
 pub mod models;

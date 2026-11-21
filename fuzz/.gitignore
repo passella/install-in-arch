@@ -1,5 +1,8 @@
 target
-corpus
+corpus/*
+!corpus/apk_parser/
+corpus/apk_parser/*
+!corpus/apk_parser/*.apk
 artifacts
 coverage
 Cargo.lock

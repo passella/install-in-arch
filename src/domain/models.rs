@@ -71,8 +71,13 @@ impl PackageVersion {
 
         if let Some((upstream, release)) = pre_sanitized.rsplit_once('-') {
             let clean_upstream = sanitize_pkgver_segment(upstream);
-            if !clean_upstream.is_empty() && is_valid_pkgrel(release) {
-                return Ok(Self(format!("{clean_upstream}-{release}")));
+            if !clean_upstream.is_empty() {
+                if is_valid_pkgrel(release) {
+                    return Ok(Self(format!("{clean_upstream}-{release}")));
+                }
+                if let Some(alpine_rel) = parse_alpine_pkgrel(release) {
+                    return Ok(Self(format!("{clean_upstream}-{alpine_rel}")));
+                }
             }
         }
 
@@ -154,6 +159,17 @@ fn is_valid_pkgrel(segment: &str) -> bool {
     }
 }
 
+fn parse_alpine_pkgrel(segment: &str) -> Option<String> {
+    let digits = segment
+        .strip_prefix('r')
+        .or_else(|| segment.strip_prefix('R'))?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let val = digits.parse::<u64>().ok()?;
+    val.checked_add(1).map(|v| v.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArchArchitecture {
     X86_64,
@@ -168,9 +184,23 @@ impl ArchArchitecture {
         match format {
             SourcePackageFormat::Deb => Self::from_debian_arch(raw),
             SourcePackageFormat::Rpm => Self::from_rpm_arch(raw),
+            SourcePackageFormat::Apk => Self::from_apk_arch(raw),
             SourcePackageFormat::Unsupported(ext) => {
                 Err(DomainError::UnsupportedPackageFormat(ext.clone()))
             }
+        }
+    }
+
+    pub fn from_apk_arch(raw: &str) -> Result<Self, DomainError> {
+        let trimmed = Self::normalize_arch_input(raw)?;
+        match trimmed.as_str() {
+            "x86_64" | "amd64" => Ok(Self::X86_64),
+            "aarch64" | "arm64" => Ok(Self::Aarch64),
+            "x86" | "i386" | "i486" | "i586" | "i686" => Ok(Self::I686),
+            "noarch" | "any" | "all" | "" => Ok(Self::Any),
+            "armv7" | "armhf" => Ok(Self::Other("armv7h".to_string())),
+            "armel" => Ok(Self::Other("arm".to_string())),
+            other => Self::validate_other_arch(raw, other),
         }
     }
 
@@ -253,6 +283,7 @@ impl fmt::Display for ArchArchitecture {
 pub enum SourcePackageFormat {
     Deb,
     Rpm,
+    Apk,
     Unsupported(String),
 }
 
@@ -265,9 +296,68 @@ impl SourcePackageFormat {
         match ext.as_deref() {
             Some("deb") => Self::Deb,
             Some("rpm") => Self::Rpm,
+            Some("apk") => Self::Apk,
             Some(other) => Self::Unsupported(other.to_string()),
             None => Self::Unsupported(String::new()),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectedScript {
+    pub name: String,
+    pub interpreter: Option<String>,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyOverride {
+    pub source: String,
+    pub target: PackageName,
+}
+
+impl DependencyOverride {
+    pub fn parse(raw: &str) -> Result<Self, DomainError> {
+        if raw
+            .chars()
+            .any(|ch| ch.is_control() || is_bidi_or_invisible_format(ch))
+        {
+            return Err(DomainError::InvalidControlMetadata(format!(
+                "invalid dependency mapping '{}': control characters are not allowed",
+                sanitize_for_error(raw)
+            )));
+        }
+        let Some((src_raw, dst_raw)) = raw.split_once('=') else {
+            return Err(DomainError::InvalidControlMetadata(format!(
+                "invalid dependency mapping '{}': expected <SRC=DST>",
+                sanitize_for_error(raw)
+            )));
+        };
+        let source = src_raw.trim().to_ascii_lowercase();
+        let target_raw = dst_raw.trim();
+        if source.is_empty() || target_raw.is_empty() {
+            return Err(DomainError::InvalidControlMetadata(format!(
+                "invalid dependency mapping '{}': SRC and DST must be non-empty",
+                sanitize_for_error(raw)
+            )));
+        }
+        if source.starts_with('-') || target_raw.starts_with('-') {
+            return Err(DomainError::InvalidControlMetadata(format!(
+                "invalid dependency mapping '{}': names cannot start with '-'",
+                sanitize_for_error(raw)
+            )));
+        }
+        if !target_raw
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '@' | '.' | '_' | '+' | '-'))
+            || target_raw.starts_with('.')
+        {
+            return Err(DomainError::InvalidPackageName(sanitize_for_error(
+                target_raw,
+            )));
+        }
+        let target = PackageName::parse_and_sanitize(target_raw)?;
+        Ok(Self { source, target })
     }
 }
 
@@ -380,6 +470,7 @@ pub struct InstallOptions {
     pub allow_suid: bool,
     pub max_uncompressed_bytes: u64,
     pub staging_dir: Option<PathBuf>,
+    pub dependency_overrides: Vec<DependencyOverride>,
 }
 
 impl Default for InstallOptions {
@@ -394,6 +485,7 @@ impl Default for InstallOptions {
             allow_suid: false,
             max_uncompressed_bytes: DEFAULT_MAX_UNCOMPRESSED_BYTES,
             staging_dir: None,
+            dependency_overrides: Vec::new(),
         }
     }
 }
@@ -410,7 +502,94 @@ pub struct UninstallOptions {
 mod tests {
     use std::path::Path;
 
-    use super::{ArchArchitecture, PackageName, PackageVersion, SourcePackageFormat};
+    use super::{
+        ArchArchitecture, DependencyOverride, PackageName, PackageVersion, SourcePackageFormat,
+    };
+
+    #[test]
+    fn dependency_override_validates_bva_and_alpine_pkgver_and_arch_mappings() {
+        let ov = DependencyOverride::parse("  LibSSL3 = OpenSSL ");
+        assert!(ov.is_ok());
+        if let Ok(parsed) = ov {
+            assert_eq!(parsed.source, "libssl3");
+            assert_eq!(parsed.target.as_str(), "openssl");
+        }
+
+        let so_ov = DependencyOverride::parse("so:libcrypto.so.3=openssl-3.0");
+        assert!(so_ov.is_ok());
+        if let Ok(parsed) = so_ov {
+            assert_eq!(parsed.source, "so:libcrypto.so.3");
+            assert_eq!(parsed.target.as_str(), "openssl-3.0");
+        }
+
+        for invalid in [
+            "",
+            "=",
+            "foo=",
+            "=bar",
+            "   =   ",
+            "no-equals",
+            "-foo=bar",
+            "foo=-bar",
+            "foo=.hidden",
+            "foo=bar!baz",
+            "foo=bar/baz",
+            "foo=bar\n",
+            "foo=bar\x1b[31m",
+            "foo=bar\u{202E}",
+        ] {
+            assert!(
+                DependencyOverride::parse(invalid).is_err(),
+                "expected Err for invalid override '{invalid:?}'"
+            );
+        }
+
+        assert_eq!(
+            PackageVersion::parse_and_sanitize("1.2.3-r0").map(|v| v.to_string()),
+            Ok("1.2.3-1".to_string())
+        );
+        assert_eq!(
+            PackageVersion::parse_and_sanitize("3.19.1-r12").map(|v| v.to_string()),
+            Ok("3.19.1-13".to_string())
+        );
+        assert_eq!(
+            PackageVersion::parse_and_sanitize("1.0_alpha2-R4").map(|v| v.to_string()),
+            Ok("1.0_alpha2-5".to_string())
+        );
+
+        assert_eq!(
+            ArchArchitecture::from_apk_arch("x86_64").map(|a| a.as_str().to_string()),
+            Ok("x86_64".to_string())
+        );
+        assert_eq!(
+            ArchArchitecture::from_apk_arch("aarch64").map(|a| a.as_str().to_string()),
+            Ok("aarch64".to_string())
+        );
+        assert_eq!(
+            ArchArchitecture::from_apk_arch("x86").map(|a| a.as_str().to_string()),
+            Ok("i686".to_string())
+        );
+        assert_eq!(
+            ArchArchitecture::from_apk_arch("noarch").map(|a| a.as_str().to_string()),
+            Ok("any".to_string())
+        );
+        assert_eq!(
+            ArchArchitecture::from_apk_arch("armv7").map(|a| a.as_str().to_string()),
+            Ok("armv7h".to_string())
+        );
+        assert_eq!(
+            ArchArchitecture::from_source_arch(&SourcePackageFormat::Apk, "x86")
+                .map(|a| a.as_str().to_string()),
+            Ok("i686".to_string())
+        );
+        assert!(ArchArchitecture::from_apk_arch("x86_64\nevil").is_err());
+        assert!(ArchArchitecture::from_apk_arch("../evil").is_err());
+
+        assert_eq!(
+            SourcePackageFormat::from_path(Path::new("/tmp/pkg.APK")),
+            SourcePackageFormat::Apk
+        );
+    }
 
     #[test]
     fn package_name_rejects_empty_and_punctuation_only() {

@@ -17,14 +17,17 @@ use crate::adapters::outbound::deb_package_adapter::{MAX_XZ_MEMLIMIT_BYTES, Stri
 use crate::domain::control_parser::sanitize_single_line_value;
 use crate::domain::error::DomainError;
 use crate::domain::models::{
-    DEFAULT_MAX_UNCOMPRESSED_BYTES, PackageName, SourcePackageFormat, SourcePackageMetadata,
+    DEFAULT_MAX_UNCOMPRESSED_BYTES, InspectedScript, PackageName, SourcePackageFormat,
+    SourcePackageMetadata,
 };
 use crate::domain::ports::{
     ArchPackageConverterPort, PackageConversionRequest, SourcePackageInspectorPort,
     StagedArchPackage,
 };
 use crate::domain::rpm_dependency_parser::{parse_rpm_requires, sanitize_rpm_relation_names};
-use crate::domain::sanitizer::sanitize_for_error;
+use crate::domain::sanitizer::{
+    sanitize_for_error, sanitize_multiline_script_text, sanitize_terminal_text,
+};
 
 const RPM_LEAD_SIZE: usize = 96;
 const RPM_LEAD_MAGIC: [u8; 4] = [0xED, 0xAB, 0xEE, 0xDB];
@@ -683,6 +686,76 @@ impl RpmPackageAdapter {
         scripts
     }
 
+    fn format_interpreter(program: Option<&[String]>) -> Option<String> {
+        let items = program?;
+        let joined: Vec<String> = items
+            .iter()
+            .map(|item| sanitize_terminal_text(item))
+            .filter(|item| !item.is_empty())
+            .collect();
+        if joined.is_empty() {
+            None
+        } else {
+            Some(joined.join(" "))
+        }
+    }
+
+    fn collect_detailed_scriptlets(metadata: &PackageMetadata) -> Vec<InspectedScript> {
+        let candidates = [
+            ("pretrans", metadata.get_pre_trans_script()),
+            ("prein", metadata.get_pre_install_script()),
+            ("postin", metadata.get_post_install_script()),
+            ("preun", metadata.get_pre_uninstall_script()),
+            ("postun", metadata.get_post_uninstall_script()),
+            ("posttrans", metadata.get_post_trans_script()),
+            ("preuntrans", metadata.get_pre_untrans_script()),
+            ("postuntrans", metadata.get_post_untrans_script()),
+            ("verifyscript", metadata.get_verify_script()),
+        ];
+
+        let mut scripts = Vec::new();
+        for (name, res) in candidates {
+            if let Ok(scriptlet) = res
+                && Self::is_scriptlet_active(&scriptlet.script, scriptlet.program.as_deref())
+            {
+                scripts.push(InspectedScript {
+                    name: name.to_string(),
+                    interpreter: Self::format_interpreter(scriptlet.program.as_deref()),
+                    content: sanitize_multiline_script_text(&scriptlet.script),
+                });
+            }
+        }
+
+        let trigger_candidates = [
+            ("trigger", metadata.get_triggers()),
+            ("filetrigger", metadata.get_file_triggers()),
+            ("transfiletrigger", metadata.get_trans_file_triggers()),
+        ];
+        for (name, res) in trigger_candidates {
+            if let Ok(triggers) = res {
+                let active: Vec<&rpm::Trigger> = triggers
+                    .iter()
+                    .filter(|t| Self::is_scriptlet_active(&t.script, Some(&t.program)))
+                    .collect();
+                let count = active.len();
+                for (idx, trig) in active.into_iter().enumerate() {
+                    let label = if count == 1 {
+                        name.to_string()
+                    } else {
+                        format!("{name}[{}]", idx + 1)
+                    };
+                    scripts.push(InspectedScript {
+                        name: label,
+                        interpreter: Self::format_interpreter(Some(&trig.program)),
+                        content: sanitize_multiline_script_text(&trig.script),
+                    });
+                }
+            }
+        }
+
+        scripts
+    }
+
     fn extract_description(metadata: &PackageMetadata) -> String {
         if let Ok(summary) = metadata.get_summary() {
             let clean = sanitize_single_line_value(summary);
@@ -1176,6 +1249,29 @@ pub fn convert_rpm_reader<R: Read + Seek + 'static>(
     stager.finish(request)
 }
 
+pub fn inspect_rpm_scripts_reader<R: Read>(
+    mut reader: R,
+    source_path: &Path,
+) -> Result<Vec<InspectedScript>, DomainError> {
+    let raw_headers = prevalidate_rpm_headers(&mut reader, source_path)?;
+    let mut header_cursor = Cursor::new(&raw_headers);
+    let metadata = PackageMetadata::parse(&mut header_cursor)
+        .map_err(|err| map_rpm_error(source_path, err))?;
+
+    metadata
+        .verify_digests()
+        .map_err(|err| map_rpm_error(source_path, err))?;
+
+    if metadata.is_source_package() {
+        return Err(invalid_rpm(
+            source_path,
+            "source RPM packages (.src.rpm) are not supported",
+        ));
+    }
+
+    Ok(RpmPackageAdapter::collect_detailed_scriptlets(&metadata))
+}
+
 impl SourcePackageInspectorPort for RpmPackageAdapter {
     fn supports(&self, format: &SourcePackageFormat) -> bool {
         matches!(format, SourcePackageFormat::Rpm)
@@ -1188,6 +1284,15 @@ impl SourcePackageInspectorPort for RpmPackageAdapter {
         let file = open_source_file(source_path)?;
         let reader = BufReader::with_capacity(64 * 1024, file);
         inspect_rpm_reader(reader, source_path)
+    }
+
+    fn read_maintainer_scripts(
+        &self,
+        source_path: &Path,
+    ) -> Result<Vec<InspectedScript>, DomainError> {
+        let file = open_source_file(source_path)?;
+        let reader = BufReader::with_capacity(64 * 1024, file);
+        inspect_rpm_scripts_reader(reader, source_path)
     }
 }
 

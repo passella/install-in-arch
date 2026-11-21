@@ -70,6 +70,7 @@ impl<'a> InstallPackageUseCase<'a> {
         let format_label = match &format {
             SourcePackageFormat::Deb => "deb".to_string(),
             SourcePackageFormat::Rpm => "rpm".to_string(),
+            SourcePackageFormat::Apk => "apk".to_string(),
             SourcePackageFormat::Unsupported(ext) => {
                 let label = if ext.is_empty() {
                     command.source_path.display().to_string()
@@ -118,7 +119,10 @@ impl<'a> InstallPackageUseCase<'a> {
         let mut all_clauses = control.pre_depends.clone();
         all_clauses.extend(control.depends.iter().cloned());
 
-        let resolver = DependencyResolver::new(self.arch_repo);
+        let resolver = DependencyResolver::with_overrides(
+            self.arch_repo,
+            &command.options.dependency_overrides,
+        )?;
         let resolved = resolver.resolve_for_format(
             &format,
             &all_clauses,
@@ -132,6 +136,10 @@ impl<'a> InstallPackageUseCase<'a> {
                     "RPM scriptlets detected ({}) — skipped and NOT executed automatically.",
                     sanitize_terminal_text(&control.maintainer_scripts.join(", "))
                 ),
+                SourcePackageFormat::Apk => format!(
+                    "Alpine APK install scripts detected ({}) — skipped and NOT executed automatically.",
+                    sanitize_terminal_text(&control.maintainer_scripts.join(", "))
+                ),
                 _ => format!(
                     "Debian maintainer scripts detected ({}) — skipped and NOT executed automatically.",
                     sanitize_terminal_text(&control.maintainer_scripts.join(", "))
@@ -142,6 +150,7 @@ impl<'a> InstallPackageUseCase<'a> {
         if !resolved.unresolved_clauses.is_empty() {
             let dep_label = match format {
                 SourcePackageFormat::Rpm => "RPM",
+                SourcePackageFormat::Apk => "Alpine APK",
                 _ => "Debian",
             };
             warnings.push(format!(

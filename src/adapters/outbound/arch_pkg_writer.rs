@@ -34,6 +34,7 @@ const STICKY_BIT: u32 = 0o1000;
 pub enum ArchiveKind {
     Deb,
     Rpm,
+    Apk,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -50,6 +51,10 @@ pub fn archive_error(kind: ArchiveKind, path: &Path, reason: impl Into<String>) 
             reason: clean_reason,
         },
         ArchiveKind::Rpm => DomainError::InvalidRpmArchive {
+            path: path.to_path_buf(),
+            reason: clean_reason,
+        },
+        ArchiveKind::Apk => DomainError::InvalidApkArchive {
             path: path.to_path_buf(),
             reason: clean_reason,
         },

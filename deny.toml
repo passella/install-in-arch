@@ -50,11 +50,3 @@ allow = [
     "Unlicense",
     "bzip2-1.0.6",
 ]
-exceptions = [
-    { crate = "install-in-arch", allow = ["LicenseRef-Unset"] },
-]
-
-[[licenses.clarify]]
-crate = "install-in-arch"
-expression = "LicenseRef-Unset"
-license-files = []

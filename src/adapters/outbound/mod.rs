@@ -1,3 +1,4 @@
+pub mod apk_package_adapter;
 pub mod arch_pkg_writer;
 pub mod common_ar;
 pub mod deb_package_adapter;

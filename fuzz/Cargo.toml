@@ -50,3 +50,10 @@ path = "fuzz_targets/path_normalizer.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "apk_parser"
+path = "fuzz_targets/apk_parser.rs"
+test = false
+doc = false
+bench = false

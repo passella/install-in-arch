@@ -8,7 +8,7 @@ pub enum DomainError {
     #[error("input file not found: {0}")]
     InputFileNotFound(PathBuf),
 
-    #[error("unsupported package format '{0}': only .deb and .rpm packages are supported")]
+    #[error("unsupported package format '{0}': only .deb, .rpm, and .apk packages are supported")]
     UnsupportedPackageFormat(String),
 
     #[error("invalid .deb archive '{path}': {reason}")]
@@ -16,6 +16,9 @@ pub enum DomainError {
 
     #[error("invalid .rpm archive '{path}': {reason}")]
     InvalidRpmArchive { path: PathBuf, reason: String },
+
+    #[error("invalid .apk archive '{path}': {reason}")]
+    InvalidApkArchive { path: PathBuf, reason: String },
 
     #[error("unsupported archive compression in '{member}': {reason}")]
     UnsupportedArchiveCompression { member: String, reason: String },
@@ -75,6 +78,10 @@ impl DomainError {
                 reason: sanitize_for_error(&reason),
             },
             Self::InvalidRpmArchive { path, reason } => Self::InvalidRpmArchive {
+                path,
+                reason: sanitize_for_error(&reason),
+            },
+            Self::InvalidApkArchive { path, reason } => Self::InvalidApkArchive {
                 path,
                 reason: sanitize_for_error(&reason),
             },

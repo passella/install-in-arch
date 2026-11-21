@@ -21,6 +21,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
+      pkgver: ${{ steps.meta.outputs.pkgver }}
       is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
 
     steps:
@@ -65,6 +66,11 @@ jobs:
               print("Error: resolved release tag contains invalid newline characters.", file=sys.stderr)
               sys.exit(1)
 
+          pkg_ver = version.replace("-", ".")
+          if not re.fullmatch(r"[A-Za-z0-9._+~]+", pkg_ver):
+              print(f"Error: normalized pkgver '{pkg_ver}' contains invalid characters for makepkg.", file=sys.stderr)
+              sys.exit(1)
+
           is_prerelease = "true" if match.group(4) is not None else "false"
 
           event_name = os.environ.get("EVENT_NAME", "")
@@ -96,9 +102,10 @@ jobs:
           github_output = os.environ["GITHUB_OUTPUT"]
           with open(github_output, "a", encoding="utf-8") as fh:
               fh.write(f"tag={expected_tag}\n")
+              fh.write(f"pkgver={pkg_ver}\n")
               fh.write(f"is_prerelease={is_prerelease}\n")
 
-          print(f"Resolved release tag: {expected_tag} (prerelease={is_prerelease}, event={event_name})")
+          print(f"Resolved release tag: {expected_tag} (pkgver={pkg_ver}, prerelease={is_prerelease}, event={event_name})")
           PY
 
       - name: Verify tagged commit is an ancestor of master
@@ -198,11 +205,29 @@ jobs:
           "${BIN_PATH}" --version
 
           rm -rf dist staging
-          mkdir -p dist staging
+          mkdir -p dist staging/completions staging/man
+
+          "${BIN_PATH}" --generate-completion bash > staging/completions/install-in-arch.bash
+          "${BIN_PATH}" --generate-completion zsh > staging/completions/_install-in-arch
+          "${BIN_PATH}" --generate-completion fish > staging/completions/install-in-arch.fish
+          "${BIN_PATH}" --generate-man | gzip -9n > staging/man/install-in-arch.1.gz
+          test -s staging/completions/install-in-arch.bash
+          test -s staging/completions/_install-in-arch
+          test -s staging/completions/install-in-arch.fish
+          test -s staging/man/install-in-arch.1.gz
 
           install -m 0755 "${BIN_PATH}" staging/install-in-arch
-          cp README.md staging/README.md
-          tar -czf "dist/install-in-arch-${TAG}-${TARGET}.tar.gz" -C staging install-in-arch README.md
+          install -m 0644 README.md staging/README.md
+          install -m 0644 LICENSE-MIT staging/LICENSE-MIT
+          install -m 0644 LICENSE-APACHE staging/LICENSE-APACHE
+          tar -czf "dist/install-in-arch-${TAG}-${TARGET}.tar.gz" -C staging install-in-arch README.md LICENSE-MIT LICENSE-APACHE completions man
+
+          if [ "${TARGET}" = "x86_64-unknown-linux-musl" ]; then
+            install -m 0644 staging/completions/install-in-arch.bash dist/install-in-arch.bash
+            install -m 0644 staging/completions/_install-in-arch dist/_install-in-arch
+            install -m 0644 staging/completions/install-in-arch.fish dist/install-in-arch.fish
+            install -m 0644 staging/man/install-in-arch.1.gz dist/install-in-arch.1.gz
+          fi
 
           install -m 0755 "${BIN_PATH}" "dist/${BIN_NAME}"
           ls -lh dist/
@@ -230,6 +255,7 @@ jobs:
       - name: Validate static musl binary, tarball and synthetic .deb against real pacman
         env:
           TAG: ${{ needs.check.outputs.tag }}
+          PKG_VER: ${{ needs.check.outputs.pkgver }}
         run: |
           set -euo pipefail
           chmod +x dist/install-in-arch-linux-x86_64
@@ -242,27 +268,73 @@ jobs:
 
           tar -xzf "dist/install-in-arch-${TAG}-x86_64-unknown-linux-musl.tar.gz" -C /tmp/smoke_tar
           test -f /tmp/smoke_tar/README.md
+          test -f /tmp/smoke_tar/LICENSE-MIT
+          test -f /tmp/smoke_tar/LICENSE-APACHE
+          test -f /tmp/smoke_tar/completions/install-in-arch.bash
+          test -f /tmp/smoke_tar/completions/_install-in-arch
+          test -f /tmp/smoke_tar/completions/install-in-arch.fish
+          test -f /tmp/smoke_tar/man/install-in-arch.1.gz
           test -x /tmp/smoke_tar/install-in-arch
           /tmp/smoke_tar/install-in-arch --version
           /tmp/smoke_tar/install-in-arch --help
           /tmp/smoke_tar/install-in-arch --list
 
           printf '2.0\n' > /tmp/smoke_deb/debian-binary
-          printf 'Package: smoke-test\nVersion: 1.0.0\nArchitecture: amd64\nDescription: Smoke test package\n' > /tmp/smoke_deb/ctrl/control
-          printf '#!/bin/sh\necho smoke\n' > /tmp/smoke_deb/data/usr/bin/smoke-test
-          chmod 0755 /tmp/smoke_deb/data/usr/bin/smoke-test
+          printf 'Package: install-in-arch-smoke-deb\nVersion: 1.0.0\nArchitecture: amd64\nDescription: Smoke test package\n' > /tmp/smoke_deb/ctrl/control
+          printf '#!/bin/sh\necho smoke\n' > /tmp/smoke_deb/data/usr/bin/install-in-arch-smoke-deb
+          chmod 0755 /tmp/smoke_deb/data/usr/bin/install-in-arch-smoke-deb
           tar -czf /tmp/smoke_deb/control.tar.gz -C /tmp/smoke_deb/ctrl control
           tar -czf /tmp/smoke_deb/data.tar.gz -C /tmp/smoke_deb/data usr
           bsdtar --format=arsvr4 -cf /tmp/smoke.deb -C /tmp/smoke_deb debian-binary control.tar.gz data.tar.gz
 
           /tmp/smoke_tar/install-in-arch --dry-run --ignore-deps --keep-pkg /tmp/smoke_out /tmp/smoke.deb
-          PKG_FILE="/tmp/smoke_out/smoke-test-1.0.0-1-x86_64.pkg.tar.zst"
+          PKG_FILE="/tmp/smoke_out/install-in-arch-smoke-deb-1.0.0-1-x86_64.pkg.tar.zst"
           test -f "${PKG_FILE}"
           pacman -Qpi "${PKG_FILE}"
           pacman -Qpl "${PKG_FILE}"
-          pacman -Qpl "${PKG_FILE}" | grep -qx 'smoke-test /usr/bin/smoke-test'
+          pacman -Qpl "${PKG_FILE}" | grep -qx 'install-in-arch-smoke-deb /usr/bin/install-in-arch-smoke-deb'
+          pacman -U --noconfirm "${PKG_FILE}"
+          pacman -Qkk install-in-arch-smoke-deb
+          pacman -R --noconfirm install-in-arch-smoke-deb
 
-      - name: Validate synthetic .rpm against real pacman
+          rm -rf /tmp/self_deb pkg_dist
+          mkdir -p \
+            /tmp/self_deb/ctrl \
+            /tmp/self_deb/data/usr/bin \
+            /tmp/self_deb/data/usr/share/doc/install-in-arch \
+            /tmp/self_deb/data/usr/share/licenses/install-in-arch \
+            /tmp/self_deb/data/usr/share/bash-completion/completions \
+            /tmp/self_deb/data/usr/share/zsh/site-functions \
+            /tmp/self_deb/data/usr/share/fish/vendor_completions.d \
+            /tmp/self_deb/data/usr/share/man/man1 \
+            pkg_dist
+          printf '2.0\n' > /tmp/self_deb/debian-binary
+          printf 'Package: install-in-arch\nVersion: %s\nArchitecture: amd64\nHomepage: https://github.com/passella/install-in-arch\nLicense: MIT OR Apache-2.0\nDescription: Native converter and package manager (.deb / .rpm / .apk -> .pkg.tar.zst) in Rust for Arch Linux\n' "${PKG_VER}" > /tmp/self_deb/ctrl/control
+          install -m 0755 /tmp/smoke_tar/install-in-arch /tmp/self_deb/data/usr/bin/install-in-arch
+          install -m 0644 /tmp/smoke_tar/README.md /tmp/self_deb/data/usr/share/doc/install-in-arch/README.md
+          install -m 0644 /tmp/smoke_tar/LICENSE-MIT /tmp/self_deb/data/usr/share/licenses/install-in-arch/LICENSE-MIT
+          install -m 0644 /tmp/smoke_tar/LICENSE-APACHE /tmp/self_deb/data/usr/share/licenses/install-in-arch/LICENSE-APACHE
+          install -m 0644 /tmp/smoke_tar/completions/install-in-arch.bash /tmp/self_deb/data/usr/share/bash-completion/completions/install-in-arch
+          install -m 0644 /tmp/smoke_tar/completions/_install-in-arch /tmp/self_deb/data/usr/share/zsh/site-functions/_install-in-arch
+          install -m 0644 /tmp/smoke_tar/completions/install-in-arch.fish /tmp/self_deb/data/usr/share/fish/vendor_completions.d/install-in-arch.fish
+          install -m 0644 /tmp/smoke_tar/man/install-in-arch.1.gz /tmp/self_deb/data/usr/share/man/man1/install-in-arch.1.gz
+          tar -czf /tmp/self_deb/control.tar.gz -C /tmp/self_deb/ctrl control
+          tar -czf /tmp/self_deb/data.tar.gz -C /tmp/self_deb/data usr
+          bsdtar --format=arsvr4 -cf /tmp/self_deb/install-in-arch.deb -C /tmp/self_deb debian-binary control.tar.gz data.tar.gz
+
+          /tmp/smoke_tar/install-in-arch --dry-run --ignore-deps --keep-pkg pkg_dist /tmp/self_deb/install-in-arch.deb
+          SELF_PKG="pkg_dist/install-in-arch-${PKG_VER}-1-x86_64.pkg.tar.zst"
+          test -f "${SELF_PKG}"
+          pacman -Qpi "${SELF_PKG}"
+          pacman -Qpi "${SELF_PKG}" | grep -q 'MIT OR Apache-2.0'
+          pacman -Qpl "${SELF_PKG}" | grep -qx 'install-in-arch /usr/share/licenses/install-in-arch/LICENSE-MIT'
+          pacman -Qpl "${SELF_PKG}" | grep -qx 'install-in-arch /usr/share/licenses/install-in-arch/LICENSE-APACHE'
+          pacman -U --noconfirm "${SELF_PKG}"
+          pacman -Qkk install-in-arch
+          /usr/bin/install-in-arch --version
+          pacman -R --noconfirm install-in-arch
+
+      - name: Validate synthetic .rpm and .apk against real pacman
         run: |
           set -euo pipefail
           if [ ! -d /etc/pacman.d/gnupg ]; then
@@ -272,12 +344,12 @@ jobs:
           pacman -Sy --noconfirm archlinux-keyring
           pacman -S --noconfirm rpm-tools
 
-          rm -rf /tmp/rpmbuild /tmp/smoke_rpm_out
-          mkdir -p /tmp/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS} /tmp/smoke_rpm_out
+          rm -rf /tmp/rpmbuild /tmp/smoke_rpm_out /tmp/smoke_apk /tmp/smoke_apk_out
+          mkdir -p /tmp/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS} /tmp/smoke_rpm_out /tmp/smoke_apk/ctrl /tmp/smoke_apk/data/usr/bin /tmp/smoke_apk_out
 
-          cat <<'SPEC' > /tmp/rpmbuild/SPECS/smoke-rpm.spec
+          cat <<'SPEC' > /tmp/rpmbuild/SPECS/install-in-arch-smoke-rpm.spec
           %global debug_package %{nil}
-          Name: smoke-rpm
+          Name: install-in-arch-smoke-rpm
           Version: 1.0.0
           Release: 1
           Summary: Smoke test RPM package
@@ -289,23 +361,51 @@ jobs:
 
           %install
           mkdir -p %{buildroot}/usr/bin
-          printf '#!/bin/sh\necho smoke-rpm\n' > %{buildroot}/usr/bin/smoke-rpm
-          chmod 0755 %{buildroot}/usr/bin/smoke-rpm
+          printf '#!/bin/sh\necho smoke-rpm\n' > %{buildroot}/usr/bin/install-in-arch-smoke-rpm
+          chmod 0755 %{buildroot}/usr/bin/install-in-arch-smoke-rpm
 
           %files
-          /usr/bin/smoke-rpm
+          /usr/bin/install-in-arch-smoke-rpm
           SPEC
 
-          rpmbuild -bb --define "_topdir /tmp/rpmbuild" /tmp/rpmbuild/SPECS/smoke-rpm.spec
-          RPM_FILE="/tmp/rpmbuild/RPMS/x86_64/smoke-rpm-1.0.0-1.x86_64.rpm"
+          rpmbuild -bb --define "_topdir /tmp/rpmbuild" /tmp/rpmbuild/SPECS/install-in-arch-smoke-rpm.spec
+          RPM_FILE="/tmp/rpmbuild/RPMS/x86_64/install-in-arch-smoke-rpm-1.0.0-1.x86_64.rpm"
           test -f "${RPM_FILE}"
 
           /tmp/smoke_tar/install-in-arch --dry-run --ignore-deps --keep-pkg /tmp/smoke_rpm_out "${RPM_FILE}"
-          PKG_FILE="/tmp/smoke_rpm_out/smoke-rpm-1.0.0-1-x86_64.pkg.tar.zst"
+          PKG_FILE="/tmp/smoke_rpm_out/install-in-arch-smoke-rpm-1.0.0-1-x86_64.pkg.tar.zst"
           test -f "${PKG_FILE}"
           pacman -Qpi "${PKG_FILE}"
           pacman -Qpl "${PKG_FILE}"
-          pacman -Qpl "${PKG_FILE}" | grep -qx 'smoke-rpm /usr/bin/smoke-rpm'
+          pacman -Qpl "${PKG_FILE}" | grep -qx 'install-in-arch-smoke-rpm /usr/bin/install-in-arch-smoke-rpm'
+          pacman -U --noconfirm "${PKG_FILE}"
+          pacman -Qkk install-in-arch-smoke-rpm
+          pacman -R --noconfirm install-in-arch-smoke-rpm
+
+          printf '#!/bin/sh\necho smoke-apk\n' > /tmp/smoke_apk/data/usr/bin/install-in-arch-smoke-apk
+          chmod 0755 /tmp/smoke_apk/data/usr/bin/install-in-arch-smoke-apk
+          tar -czf /tmp/smoke_apk/data.tar.gz -C /tmp/smoke_apk/data usr
+          APK_DATAHASH="$(sha256sum /tmp/smoke_apk/data.tar.gz | awk '{print $1}')"
+          printf 'pkgname = install-in-arch-smoke-apk\npkgver = 1.0.0-r0\npkgdesc = Smoke test APK package\narch = x86_64\ndatahash = %s\n' "${APK_DATAHASH}" > /tmp/smoke_apk/ctrl/.PKGINFO
+          tar -czf /tmp/smoke_apk/control.tar.gz -C /tmp/smoke_apk/ctrl .PKGINFO
+          cat /tmp/smoke_apk/control.tar.gz /tmp/smoke_apk/data.tar.gz > /tmp/smoke_apk/smoke.apk
+
+          /tmp/smoke_tar/install-in-arch --dry-run --ignore-deps --keep-pkg /tmp/smoke_apk_out /tmp/smoke_apk/smoke.apk
+          APK_PKG_FILE="/tmp/smoke_apk_out/install-in-arch-smoke-apk-1.0.0-1-x86_64.pkg.tar.zst"
+          test -f "${APK_PKG_FILE}"
+          pacman -Qpi "${APK_PKG_FILE}"
+          pacman -Qpl "${APK_PKG_FILE}"
+          pacman -Qpl "${APK_PKG_FILE}" | grep -qx 'install-in-arch-smoke-apk /usr/bin/install-in-arch-smoke-apk'
+          pacman -U --noconfirm "${APK_PKG_FILE}"
+          pacman -Qkk install-in-arch-smoke-apk
+          pacman -R --noconfirm install-in-arch-smoke-apk
+
+      - name: Upload native Arch Linux package artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: archlinux-pkg-x86_64
+          path: pkg_dist/
+          if-no-files-found: error
 
   smoke-aarch64:
     name: Smoke Test Static Musl (aarch64)
@@ -319,9 +419,10 @@ jobs:
           name: aarch64-unknown-linux-musl
           path: dist
 
-      - name: Validate static musl binary, tarball and synthetic .deb on aarch64
+      - name: Validate static musl binary, tarball, synthetic .deb and build native aarch64 package
         env:
           TAG: ${{ needs.check.outputs.tag }}
+          PKG_VER: ${{ needs.check.outputs.pkgver }}
         run: |
           set -euo pipefail
           chmod +x dist/install-in-arch-linux-aarch64
@@ -333,6 +434,12 @@ jobs:
 
           tar -xzf "dist/install-in-arch-${TAG}-aarch64-unknown-linux-musl.tar.gz" -C /tmp/smoke_arm_tar
           test -f /tmp/smoke_arm_tar/README.md
+          test -f /tmp/smoke_arm_tar/LICENSE-MIT
+          test -f /tmp/smoke_arm_tar/LICENSE-APACHE
+          test -f /tmp/smoke_arm_tar/completions/install-in-arch.bash
+          test -f /tmp/smoke_arm_tar/completions/_install-in-arch
+          test -f /tmp/smoke_arm_tar/completions/install-in-arch.fish
+          test -f /tmp/smoke_arm_tar/man/install-in-arch.1.gz
           test -x /tmp/smoke_arm_tar/install-in-arch
           /tmp/smoke_arm_tar/install-in-arch --version
           /tmp/smoke_arm_tar/install-in-arch --help
@@ -352,6 +459,62 @@ jobs:
           PKG_FILE="/tmp/smoke_arm_out/smoke-arm-1.0.0-1-aarch64.pkg.tar.zst"
           test -s "${PKG_FILE}"
           ls -lh "${PKG_FILE}"
+
+          rm -rf /tmp/self_arm_deb pkg_dist
+          mkdir -p \
+            /tmp/self_arm_deb/ctrl \
+            /tmp/self_arm_deb/data/usr/bin \
+            /tmp/self_arm_deb/data/usr/share/doc/install-in-arch \
+            /tmp/self_arm_deb/data/usr/share/licenses/install-in-arch \
+            /tmp/self_arm_deb/data/usr/share/bash-completion/completions \
+            /tmp/self_arm_deb/data/usr/share/zsh/site-functions \
+            /tmp/self_arm_deb/data/usr/share/fish/vendor_completions.d \
+            /tmp/self_arm_deb/data/usr/share/man/man1 \
+            pkg_dist
+          printf '2.0\n' > /tmp/self_arm_deb/debian-binary
+          printf 'Package: install-in-arch\nVersion: %s\nArchitecture: arm64\nHomepage: https://github.com/passella/install-in-arch\nLicense: MIT OR Apache-2.0\nDescription: Native converter and package manager (.deb / .rpm / .apk -> .pkg.tar.zst) in Rust for Arch Linux\n' "${PKG_VER}" > /tmp/self_arm_deb/ctrl/control
+          install -m 0755 /tmp/smoke_arm_tar/install-in-arch /tmp/self_arm_deb/data/usr/bin/install-in-arch
+          install -m 0644 /tmp/smoke_arm_tar/README.md /tmp/self_arm_deb/data/usr/share/doc/install-in-arch/README.md
+          install -m 0644 /tmp/smoke_arm_tar/LICENSE-MIT /tmp/self_arm_deb/data/usr/share/licenses/install-in-arch/LICENSE-MIT
+          install -m 0644 /tmp/smoke_arm_tar/LICENSE-APACHE /tmp/self_arm_deb/data/usr/share/licenses/install-in-arch/LICENSE-APACHE
+          install -m 0644 /tmp/smoke_arm_tar/completions/install-in-arch.bash /tmp/self_arm_deb/data/usr/share/bash-completion/completions/install-in-arch
+          install -m 0644 /tmp/smoke_arm_tar/completions/_install-in-arch /tmp/self_arm_deb/data/usr/share/zsh/site-functions/_install-in-arch
+          install -m 0644 /tmp/smoke_arm_tar/completions/install-in-arch.fish /tmp/self_arm_deb/data/usr/share/fish/vendor_completions.d/install-in-arch.fish
+          install -m 0644 /tmp/smoke_arm_tar/man/install-in-arch.1.gz /tmp/self_arm_deb/data/usr/share/man/man1/install-in-arch.1.gz
+          tar -czf /tmp/self_arm_deb/control.tar.gz -C /tmp/self_arm_deb/ctrl control
+          tar -czf /tmp/self_arm_deb/data.tar.gz -C /tmp/self_arm_deb/data usr
+          (
+            cd /tmp/self_arm_deb
+            ar rcs /tmp/self_arm_deb/install-in-arch.deb debian-binary control.tar.gz data.tar.gz
+          )
+
+          /tmp/smoke_arm_tar/install-in-arch --dry-run --ignore-deps --keep-pkg pkg_dist /tmp/self_arm_deb/install-in-arch.deb
+          SELF_PKG="pkg_dist/install-in-arch-${PKG_VER}-1-aarch64.pkg.tar.zst"
+          test -s "${SELF_PKG}"
+          command -v zstd >/dev/null || (sudo apt-get update && sudo apt-get install -y zstd)
+          PKGINFO_CONTENT="$(tar --zstd -xOf "${SELF_PKG}" .PKGINFO)"
+          printf '%s\n' "${PKGINFO_CONTENT}"
+          printf '%s\n' "${PKGINFO_CONTENT}" | grep -qx 'pkgname = install-in-arch'
+          printf '%s\n' "${PKGINFO_CONTENT}" | grep -qx "pkgver = ${PKG_VER}-1"
+          printf '%s\n' "${PKGINFO_CONTENT}" | grep -qx 'arch = aarch64'
+          printf '%s\n' "${PKGINFO_CONTENT}" | grep -qx 'license = MIT OR Apache-2.0'
+          tar --zstd -xOf "${SELF_PKG}" .MTREE | gzip -dc | head -n 1 | grep -qx '#mtree'
+          PKG_ENTRIES="$(tar --zstd -tf "${SELF_PKG}")"
+          printf '%s\n' "${PKG_ENTRIES}" | grep -qx 'usr/bin/install-in-arch'
+          printf '%s\n' "${PKG_ENTRIES}" | grep -qx 'usr/share/doc/install-in-arch/README.md'
+          printf '%s\n' "${PKG_ENTRIES}" | grep -qx 'usr/share/licenses/install-in-arch/LICENSE-MIT'
+          printf '%s\n' "${PKG_ENTRIES}" | grep -qx 'usr/share/licenses/install-in-arch/LICENSE-APACHE'
+          printf '%s\n' "${PKG_ENTRIES}" | grep -qx 'usr/share/bash-completion/completions/install-in-arch'
+          printf '%s\n' "${PKG_ENTRIES}" | grep -qx 'usr/share/zsh/site-functions/_install-in-arch'
+          printf '%s\n' "${PKG_ENTRIES}" | grep -qx 'usr/share/fish/vendor_completions.d/install-in-arch.fish'
+          printf '%s\n' "${PKG_ENTRIES}" | grep -qx 'usr/share/man/man1/install-in-arch.1.gz'
+
+      - name: Upload native Arch Linux aarch64 package artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: archlinux-pkg-aarch64
+          path: pkg_dist/
+          if-no-files-found: error
 
   publish:
     name: Publish GitHub Release
@@ -381,6 +544,7 @@ jobs:
       - name: Generate unified SHA256SUMS.txt
         env:
           TAG: ${{ needs.check.outputs.tag }}
+          PKG_VER: ${{ needs.check.outputs.pkgver }}
         run: |
           set -euo pipefail
           (
@@ -390,9 +554,96 @@ jobs:
               "install-in-arch-${TAG}-aarch64-unknown-linux-musl.tar.gz" \
               "install-in-arch-linux-x86_64" \
               "install-in-arch-linux-aarch64" \
+              "install-in-arch-${PKG_VER}-1-x86_64.pkg.tar.zst" \
+              "install-in-arch-${PKG_VER}-1-aarch64.pkg.tar.zst" \
+              "install-in-arch.bash" \
+              "_install-in-arch" \
+              "install-in-arch.fish" \
+              "install-in-arch.1.gz" \
               > SHA256SUMS.txt
           )
           ls -lh dist/
+          cat dist/SHA256SUMS.txt
+
+      - name: Generate release PKGBUILD with verified SHA-256 sums
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          tag = os.environ["TAG"]
+          raw_ver = tag[1:] if tag.startswith("v") else tag
+          pkg_ver = raw_ver.replace("-", ".")
+          if not re.fullmatch(r"[A-Za-z0-9._+~]+", pkg_ver):
+              print(f"Error: normalized pkgver '{pkg_ver}' contains invalid characters for makepkg.", file=sys.stderr)
+              sys.exit(1)
+
+          sums_path = Path("dist/SHA256SUMS.txt")
+          template_path = Path("packaging/aur/PKGBUILD")
+          output_path = Path("dist/PKGBUILD")
+
+          digests = {}
+          for raw_line in sums_path.read_text(encoding="utf-8").splitlines():
+              parts = raw_line.strip().split()
+              if len(parts) == 2:
+                  digests[parts[1]] = parts[0]
+
+          x86_asset = f"install-in-arch-{tag}-x86_64-unknown-linux-musl.tar.gz"
+          arm_asset = f"install-in-arch-{tag}-aarch64-unknown-linux-musl.tar.gz"
+          sha_x86 = digests.get(x86_asset, "")
+          sha_arm = digests.get(arm_asset, "")
+
+          hex64 = re.compile(r"\A[0-9a-f]{64}\Z")
+          if not hex64.fullmatch(sha_x86) or not hex64.fullmatch(sha_arm):
+              print("Error: missing or invalid SHA-256 digest in dist/SHA256SUMS.txt.", file=sys.stderr)
+              sys.exit(1)
+
+          content = template_path.read_text(encoding="utf-8")
+          content, pkgver_count = re.subn(
+              r"(?m)^pkgver=.*$",
+              lambda _: f"pkgver={pkg_ver}",
+              content,
+          )
+          if pkgver_count != 1:
+              print("Error: expected exactly one pkgver assignment in packaging/aur/PKGBUILD.", file=sys.stderr)
+              sys.exit(1)
+
+          content, tag_count = re.subn(
+              r"(?m)^_tag=.*$",
+              lambda _: f"_tag={tag}",
+              content,
+          )
+          if tag_count != 1:
+              print("Error: expected exactly one _tag assignment in packaging/aur/PKGBUILD.", file=sys.stderr)
+              sys.exit(1)
+
+          placeholder = "REPLACE_WITH_SHA256_FROM_RELEASE_SHA256SUMS_TXT"
+          x86_old = f"sha256sums_x86_64=('{placeholder}')"
+          arm_old = f"sha256sums_aarch64=('{placeholder}')"
+          if content.count(x86_old) != 1 or content.count(arm_old) != 1:
+              print("Error: expected fail-closed sha256sums placeholders in packaging/aur/PKGBUILD.", file=sys.stderr)
+              sys.exit(1)
+
+          content = content.replace(x86_old, f"sha256sums_x86_64=('{sha_x86}')", 1)
+          content = content.replace(arm_old, f"sha256sums_aarch64=('{sha_arm}')", 1)
+
+          if placeholder in content or "'SKIP'" in content:
+              print("Error: rendered PKGBUILD still contains unverified checksum markers.", file=sys.stderr)
+              sys.exit(1)
+
+          output_path.write_text(content, encoding="utf-8")
+          PY
+          bash -n dist/PKGBUILD
+          (
+            cd dist
+            sha256sum "PKGBUILD" >> SHA256SUMS.txt
+          )
+          cat dist/PKGBUILD
           cat dist/SHA256SUMS.txt
 
       - name: Attest build provenance

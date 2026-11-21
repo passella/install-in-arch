@@ -92,10 +92,11 @@ impl<'a> UninstallPackageUseCase<'a> {
         let as_path = Path::new(trimmed);
         let format = SourcePackageFormat::from_path(as_path);
         match &format {
-            SourcePackageFormat::Deb | SourcePackageFormat::Rpm => {
+            SourcePackageFormat::Deb | SourcePackageFormat::Rpm | SourcePackageFormat::Apk => {
                 let label = match format {
                     SourcePackageFormat::Deb => "deb",
                     SourcePackageFormat::Rpm => "rpm",
+                    SourcePackageFormat::Apk => "apk",
                     SourcePackageFormat::Unsupported(_) => "",
                 };
                 let inspector = self

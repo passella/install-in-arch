@@ -79,6 +79,89 @@ jobs:
           cargo build --release --locked
           ./target/release/install-in-arch --version
           ./target/release/install-in-arch --help
+          ./target/release/install-in-arch --generate-completion bash > /tmp/install-in-arch.bash
+          ./target/release/install-in-arch --generate-completion zsh > /tmp/_install-in-arch
+          ./target/release/install-in-arch --generate-completion fish > /tmp/install-in-arch.fish
+          ./target/release/install-in-arch --generate-man | gzip -9n > /tmp/install-in-arch.1.gz
+          test -s /tmp/install-in-arch.bash
+          test -s /tmp/_install-in-arch
+          test -s /tmp/install-in-arch.fish
+          test -s /tmp/install-in-arch.1.gz
+
+      - name: Validate converted .deb, .rpm and .apk with pacman -U, pacman -Qkk and pacman -R
+        run: |
+          set -euo pipefail
+          pacman -S --noconfirm rpm-tools
+
+          rm -rf /tmp/ci_smoke
+          mkdir -p /tmp/ci_smoke/deb/ctrl /tmp/ci_smoke/deb/data/usr/bin /tmp/ci_smoke/out
+
+          printf '2.0\n' > /tmp/ci_smoke/deb/debian-binary
+          printf 'Package: install-in-arch-smoke-deb\nVersion: 1.0.0\nArchitecture: amd64\nDescription: CI smoke test deb package\n' > /tmp/ci_smoke/deb/ctrl/control
+          printf '#!/bin/sh\necho smoke-deb\n' > /tmp/ci_smoke/deb/data/usr/bin/install-in-arch-smoke-deb
+          chmod 0755 /tmp/ci_smoke/deb/data/usr/bin/install-in-arch-smoke-deb
+          tar -czf /tmp/ci_smoke/deb/control.tar.gz -C /tmp/ci_smoke/deb/ctrl control
+          tar -czf /tmp/ci_smoke/deb/data.tar.gz -C /tmp/ci_smoke/deb/data usr
+          bsdtar --format=arsvr4 -cf /tmp/ci_smoke/smoke.deb -C /tmp/ci_smoke/deb debian-binary control.tar.gz data.tar.gz
+
+          ./target/release/install-in-arch --dry-run --ignore-deps --keep-pkg /tmp/ci_smoke/out /tmp/ci_smoke/smoke.deb
+          DEB_PKG="/tmp/ci_smoke/out/install-in-arch-smoke-deb-1.0.0-1-x86_64.pkg.tar.zst"
+          test -f "${DEB_PKG}"
+          pacman -U --noconfirm "${DEB_PKG}"
+          pacman -Qkk install-in-arch-smoke-deb
+          /usr/bin/install-in-arch-smoke-deb | grep -qx 'smoke-deb'
+          pacman -R --noconfirm install-in-arch-smoke-deb
+
+          mkdir -p /tmp/ci_smoke/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cat <<'SPEC' > /tmp/ci_smoke/rpmbuild/SPECS/install-in-arch-smoke-rpm.spec
+          %global debug_package %{nil}
+          Name: install-in-arch-smoke-rpm
+          Version: 1.0.0
+          Release: 1
+          Summary: CI smoke test RPM package
+          License: MIT
+          BuildArch: x86_64
+
+          %description
+          Synthetic RPM package for Arch Linux CI smoke validation.
+
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          printf '#!/bin/sh\necho smoke-rpm\n' > %{buildroot}/usr/bin/install-in-arch-smoke-rpm
+          chmod 0755 %{buildroot}/usr/bin/install-in-arch-smoke-rpm
+
+          %files
+          /usr/bin/install-in-arch-smoke-rpm
+          SPEC
+
+          rpmbuild -bb --define "_topdir /tmp/ci_smoke/rpmbuild" /tmp/ci_smoke/rpmbuild/SPECS/install-in-arch-smoke-rpm.spec
+          RPM_FILE="/tmp/ci_smoke/rpmbuild/RPMS/x86_64/install-in-arch-smoke-rpm-1.0.0-1.x86_64.rpm"
+          test -f "${RPM_FILE}"
+
+          ./target/release/install-in-arch --dry-run --ignore-deps --keep-pkg /tmp/ci_smoke/out "${RPM_FILE}"
+          RPM_PKG="/tmp/ci_smoke/out/install-in-arch-smoke-rpm-1.0.0-1-x86_64.pkg.tar.zst"
+          test -f "${RPM_PKG}"
+          pacman -U --noconfirm "${RPM_PKG}"
+          pacman -Qkk install-in-arch-smoke-rpm
+          /usr/bin/install-in-arch-smoke-rpm | grep -qx 'smoke-rpm'
+          pacman -R --noconfirm install-in-arch-smoke-rpm
+
+          mkdir -p /tmp/ci_smoke/apk/ctrl /tmp/ci_smoke/apk/data/usr/bin
+          printf '#!/bin/sh\necho smoke-apk\n' > /tmp/ci_smoke/apk/data/usr/bin/install-in-arch-smoke-apk
+          chmod 0755 /tmp/ci_smoke/apk/data/usr/bin/install-in-arch-smoke-apk
+          tar -czf /tmp/ci_smoke/apk/data.tar.gz -C /tmp/ci_smoke/apk/data usr
+          APK_DATAHASH="$(sha256sum /tmp/ci_smoke/apk/data.tar.gz | awk '{print $1}')"
+          printf 'pkgname = install-in-arch-smoke-apk\npkgver = 1.0.0-r0\npkgdesc = CI smoke test APK package\narch = x86_64\ndatahash = %s\n' "${APK_DATAHASH}" > /tmp/ci_smoke/apk/ctrl/.PKGINFO
+          tar -czf /tmp/ci_smoke/apk/control.tar.gz -C /tmp/ci_smoke/apk/ctrl .PKGINFO
+          cat /tmp/ci_smoke/apk/control.tar.gz /tmp/ci_smoke/apk/data.tar.gz > /tmp/ci_smoke/smoke.apk
+
+          ./target/release/install-in-arch --dry-run --ignore-deps --keep-pkg /tmp/ci_smoke/out /tmp/ci_smoke/smoke.apk
+          APK_PKG="/tmp/ci_smoke/out/install-in-arch-smoke-apk-1.0.0-1-x86_64.pkg.tar.zst"
+          test -f "${APK_PKG}"
+          pacman -U --noconfirm "${APK_PKG}"
+          pacman -Qkk install-in-arch-smoke-apk
+          /usr/bin/install-in-arch-smoke-apk | grep -qx 'smoke-apk'
+          pacman -R --noconfirm install-in-arch-smoke-apk
 
   security-audit:
     name: Security & Dependency Policy Audit
@@ -114,3 +197,37 @@ jobs:
           advanced-security: false
           online-audits: true
           persona: regular
+
+  fuzz-smoke:
+    name: Weekly Cargo Fuzz Smoke
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust stable and nightly toolchains
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal
+          rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-fuzz
+        run: |
+          set -euo pipefail
+          cargo +stable install --locked cargo-fuzz
+
+      - name: Run fuzz smoke targets
+        run: |
+          set -euo pipefail
+          for target in deb_ar_parser rpm_header_parser apk_parser control_parser rpm_dependency_parser path_normalizer; do
+            echo "::group::Fuzzing ${target}"
+            cargo +nightly fuzz run "${target}" -- -max_total_time=30
+            echo "::endgroup::"
+          done

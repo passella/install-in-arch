@@ -15,18 +15,21 @@ use crate::adapters::outbound::common_ar::CommonArReader;
 use crate::domain::control_parser::parse_control_file;
 use crate::domain::error::DomainError;
 use crate::domain::models::{
-    DEFAULT_MAX_UNCOMPRESSED_BYTES, SourcePackageFormat, SourcePackageMetadata,
+    DEFAULT_MAX_UNCOMPRESSED_BYTES, InspectedScript, SourcePackageFormat, SourcePackageMetadata,
 };
 use crate::domain::ports::{
     ArchPackageConverterPort, PackageConversionRequest, SourcePackageInspectorPort,
     StagedArchPackage,
 };
-use crate::domain::sanitizer::sanitize_for_error;
+use crate::domain::sanitizer::{
+    sanitize_for_error, sanitize_multiline_script_text, sanitize_terminal_text,
+};
 
 pub const MAX_XZ_MEMLIMIT_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CONTROL_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_CONTROL_ENTRIES: usize = 4_096;
 pub const MAX_TAR_EXT_BYTES: u64 = 1024 * 1024;
+pub const MAX_SCRIPT_FILE_BYTES: usize = 4 * 1024 * 1024;
 const TAR_BLOCK_SIZE: usize = 512;
 
 pub struct StrictBoundedReader<R> {
@@ -38,12 +41,29 @@ pub struct StrictBoundedReader<R> {
 
 impl<R> StrictBoundedReader<R> {
     pub fn new(inner: R, limit: u64, resource_label: &'static str) -> Self {
+        Self::with_initial_bytes(inner, 0, limit, resource_label)
+    }
+
+    pub fn with_initial_bytes(
+        inner: R,
+        initial_bytes: u64,
+        limit: u64,
+        resource_label: &'static str,
+    ) -> Self {
         Self {
             inner,
-            read_bytes: 0,
+            read_bytes: initial_bytes,
             limit,
             resource_label,
         }
+    }
+
+    pub fn bytes_read(&self) -> u64 {
+        self.read_bytes
+    }
+
+    pub fn into_inner(self) -> R {
+        self.inner
     }
 }
 
@@ -70,7 +90,7 @@ impl<R: Read> Read for StrictBoundedReader<R> {
     }
 }
 
-struct TarHeaderGuardReader<R> {
+pub struct TarHeaderGuardReader<R> {
     inner: R,
     hdr_buf: [u8; TAR_BLOCK_SIZE],
     hdr_pos: usize,
@@ -83,8 +103,14 @@ struct TarHeaderGuardReader<R> {
     max_entry_bytes: u64,
 }
 
+impl<R> TarHeaderGuardReader<R> {
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
 impl<R: Read> TarHeaderGuardReader<R> {
-    fn new(inner: R, max_entry_bytes: u64) -> Self {
+    pub fn new(inner: R, max_entry_bytes: u64) -> Self {
         Self {
             inner,
             hdr_buf: [0u8; TAR_BLOCK_SIZE],
@@ -418,10 +444,7 @@ impl DebPackageAdapter {
                     });
                 }
                 control_raw = Some(content);
-            } else if matches!(
-                clean_name.as_str(),
-                "preinst" | "postinst" | "prerm" | "postrm"
-            ) {
+            } else if is_debian_maintainer_script_name(&clean_name) {
                 maintainer_scripts.push(clean_name);
             }
         }
@@ -434,6 +457,101 @@ impl DebPackageAdapter {
         maintainer_scripts.sort();
         maintainer_scripts.dedup();
         parse_control_file(&control_content, maintainer_scripts)
+    }
+
+    fn extract_control_tar_scripts(
+        deb_path: &Path,
+        member_name: &str,
+        reader: impl Read,
+    ) -> Result<Vec<InspectedScript>, DomainError> {
+        let decoded = Self::decode_member_stream(
+            member_name,
+            reader,
+            MAX_CONTROL_ARCHIVE_BYTES,
+            "control archive uncompressed bytes",
+        )?;
+        let mut tar_archive = Archive::new(decoded);
+        let mut scripts: Vec<InspectedScript> = Vec::new();
+        let mut entry_count: usize = 0;
+
+        let entries = tar_archive
+            .entries()
+            .map_err(|err| DomainError::InvalidDebArchive {
+                path: deb_path.to_path_buf(),
+                reason: sanitize_for_error(&format!("failed reading {member_name}: {err}")),
+            })?;
+
+        for entry_res in entries {
+            entry_count += 1;
+            if entry_count > MAX_CONTROL_ENTRIES {
+                return Err(DomainError::ResourceLimitExceeded {
+                    resource: "control archive entries".to_string(),
+                    limit: MAX_CONTROL_ENTRIES as u64,
+                    context: sanitize_for_error(member_name),
+                });
+            }
+
+            let mut entry = entry_res.map_err(|err| DomainError::InvalidDebArchive {
+                path: deb_path.to_path_buf(),
+                reason: sanitize_for_error(&format!("corrupt tar entry in {member_name}: {err}")),
+            })?;
+
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+
+            let entry_path = entry.path().map_err(|err| DomainError::InvalidDebArchive {
+                path: deb_path.to_path_buf(),
+                reason: sanitize_for_error(&format!(
+                    "invalid control path in {member_name}: {err}"
+                )),
+            })?;
+            let raw_path = entry_path
+                .to_str()
+                .ok_or_else(|| DomainError::InvalidDebArchive {
+                    path: deb_path.to_path_buf(),
+                    reason: format!("non-UTF8 path in {member_name}"),
+                })?
+                .to_string();
+
+            let clean_name = raw_path
+                .trim_start_matches("./")
+                .trim_start_matches('/')
+                .to_string();
+
+            if is_debian_maintainer_script_name(&clean_name) {
+                let mut raw_bytes = Vec::new();
+                entry
+                    .by_ref()
+                    .take((MAX_SCRIPT_FILE_BYTES + 1) as u64)
+                    .read_to_end(&mut raw_bytes)
+                    .map_err(|err| DomainError::InvalidDebArchive {
+                        path: deb_path.to_path_buf(),
+                        reason: sanitize_for_error(&format!(
+                            "failed reading maintainer script '{clean_name}': {err}"
+                        )),
+                    })?;
+                if raw_bytes.len() > MAX_SCRIPT_FILE_BYTES {
+                    return Err(DomainError::ResourceLimitExceeded {
+                        resource: "maintainer script size".to_string(),
+                        limit: MAX_SCRIPT_FILE_BYTES as u64,
+                        context: sanitize_for_error(&clean_name),
+                    });
+                }
+                let text = String::from_utf8_lossy(&raw_bytes);
+                let sanitized = sanitize_multiline_script_text(&text);
+                if !sanitized.trim().is_empty() {
+                    scripts.push(InspectedScript {
+                        name: sanitize_terminal_text(&clean_name),
+                        interpreter: None,
+                        content: sanitized,
+                    });
+                }
+            }
+        }
+
+        scripts.sort_by_key(|s| debian_script_order(&s.name));
+        Ok(scripts)
     }
 
     fn stage_data_archive(
@@ -607,6 +725,30 @@ pub fn inspect_deb_reader<R: Read + Seek>(
     })
 }
 
+pub fn inspect_deb_scripts_reader<R: Read + Seek>(
+    reader: R,
+    source_path: &Path,
+) -> Result<Vec<InspectedScript>, DomainError> {
+    let mut archive =
+        CommonArReader::new(io::BufReader::with_capacity(64 * 1024, reader), source_path)?;
+
+    while let Some(entry) = archive.next_entry()? {
+        let member_name = entry.header().identifier.clone();
+        if member_name.starts_with("control.tar") {
+            return DebPackageAdapter::extract_control_tar_scripts(
+                source_path,
+                &member_name,
+                entry,
+            );
+        }
+    }
+
+    Err(DomainError::InvalidDebArchive {
+        path: source_path.to_path_buf(),
+        reason: "missing control.tar.* member in .deb archive".to_string(),
+    })
+}
+
 pub fn convert_deb_reader<R: Read + Seek>(
     reader: R,
     request: &PackageConversionRequest,
@@ -696,6 +838,33 @@ impl SourcePackageInspectorPort for DebPackageAdapter {
         let file = open_source_file(source_path)?;
         inspect_deb_reader(file, source_path)
     }
+
+    fn read_maintainer_scripts(
+        &self,
+        source_path: &Path,
+    ) -> Result<Vec<InspectedScript>, DomainError> {
+        let file = open_source_file(source_path)?;
+        inspect_deb_scripts_reader(file, source_path)
+    }
+}
+
+fn is_debian_maintainer_script_name(clean_name: &str) -> bool {
+    matches!(
+        clean_name,
+        "preinst" | "postinst" | "prerm" | "postrm" | "config"
+    )
+}
+
+fn debian_script_order(name: &str) -> (u8, String) {
+    let rank = match name {
+        "config" => 0,
+        "preinst" => 1,
+        "postinst" => 2,
+        "prerm" => 3,
+        "postrm" => 4,
+        _ => 5,
+    };
+    (rank, name.to_string())
 }
 
 impl ArchPackageConverterPort for DebPackageAdapter {

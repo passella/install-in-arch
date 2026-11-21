@@ -1,0 +1,28 @@
+# Maintainer: Paulão <passella@users.noreply.github.com>
+pkgname=install-in-arch-bin
+_pkgname=install-in-arch
+pkgver=1.0.0
+_tag=v1.0.0
+pkgrel=1
+pkgdesc='Native converter and package manager (.deb / .rpm / .apk -> .pkg.tar.zst) in Rust for Arch Linux'
+arch=('x86_64' 'aarch64')
+url='https://github.com/passella/install-in-arch'
+license=('MIT' 'Apache-2.0')
+depends=('pacman')
+provides=('install-in-arch')
+conflicts=('install-in-arch' 'install-in-arch-git')
+source_x86_64=("${_pkgname}-${_tag}-x86_64.tar.gz::${url}/releases/download/${_tag}/${_pkgname}-${_tag}-x86_64-unknown-linux-musl.tar.gz")
+source_aarch64=("${_pkgname}-${_tag}-aarch64.tar.gz::${url}/releases/download/${_tag}/${_pkgname}-${_tag}-aarch64-unknown-linux-musl.tar.gz")
+sha256sums_x86_64=('REPLACE_WITH_SHA256_FROM_RELEASE_SHA256SUMS_TXT')
+sha256sums_aarch64=('REPLACE_WITH_SHA256_FROM_RELEASE_SHA256SUMS_TXT')
+
+package() {
+  install -Dm755 "${srcdir}/${_pkgname}" "${pkgdir}/usr/bin/${_pkgname}"
+  install -Dm644 "${srcdir}/README.md" "${pkgdir}/usr/share/doc/${_pkgname}/README.md"
+  install -Dm644 "${srcdir}/LICENSE-MIT" "${pkgdir}/usr/share/licenses/${_pkgname}/LICENSE-MIT"
+  install -Dm644 "${srcdir}/LICENSE-APACHE" "${pkgdir}/usr/share/licenses/${_pkgname}/LICENSE-APACHE"
+  install -Dm644 "${srcdir}/completions/${_pkgname}.bash" "${pkgdir}/usr/share/bash-completion/completions/${_pkgname}"
+  install -Dm644 "${srcdir}/completions/_${_pkgname}" "${pkgdir}/usr/share/zsh/site-functions/_${_pkgname}"
+  install -Dm644 "${srcdir}/completions/${_pkgname}.fish" "${pkgdir}/usr/share/fish/vendor_completions.d/${_pkgname}.fish"
+  install -Dm644 "${srcdir}/man/${_pkgname}.1.gz" "${pkgdir}/usr/share/man/man1/${_pkgname}.1.gz"
+}

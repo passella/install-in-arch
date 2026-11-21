@@ -37,6 +37,26 @@ pub fn sanitize_terminal_text(raw: &str) -> String {
     sanitize_single_line_value(&stripped)
 }
 
+pub fn sanitize_multiline_script_text(raw: &str) -> String {
+    let stripped = strip_ansi_sequences(raw);
+    let mut out = String::with_capacity(stripped.len());
+    for ch in stripped.chars() {
+        if ch == '\r' {
+            continue;
+        }
+        if ch == '\n' || ch == '\t' {
+            out.push(ch);
+        } else if ch.is_control() {
+            let _ = write!(out, "{}", ch.escape_default());
+        } else if is_bidi_or_invisible_format(ch) {
+            let _ = write!(out, "{}", ch.escape_unicode());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 pub fn sanitize_for_error(raw: &str) -> String {
     const MAX_ERROR_PREVIEW_CHARS: usize = 512;
     let mut out = String::with_capacity(raw.len().min(MAX_ERROR_PREVIEW_CHARS));
@@ -122,9 +142,16 @@ fn strip_ansi_sequences(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_bidi_or_invisible_format, sanitize_for_error, sanitize_single_line_value,
-        sanitize_terminal_text,
+        is_bidi_or_invisible_format, sanitize_for_error, sanitize_multiline_script_text,
+        sanitize_single_line_value, sanitize_terminal_text,
     };
+
+    #[test]
+    fn sanitizes_multiline_script_preserving_newlines_and_tabs_while_stripping_ansi() {
+        let raw = "#!/bin/sh\r\n\techo \x1b[31mhi\x1b[0m\x08\u{202E}there\nexit 0\n";
+        let clean = sanitize_multiline_script_text(raw);
+        assert_eq!(clean, "#!/bin/sh\n\techo hi\\u{8}\\u{202e}there\nexit 0\n");
+    }
 
     #[test]
     fn strips_ansi_csi_osc_and_bidi_controls_in_terminal_text() {

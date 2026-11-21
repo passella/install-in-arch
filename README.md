@@ -2,9 +2,9 @@
 
 🌐 **Português (Brasil)** | [English](README.en.md) | [Español](README.es.md) | [简体中文](README.zh-CN.md)
 
-Conversor nativo e gerenciador de pacotes **`.deb` / `.rpm` → `.pkg.tar.zst`** escrito em **Rust** (Edition 2024) para **Arch Linux** e distribuições derivadas baseadas no `pacman`.
+Conversor nativo e gerenciador de pacotes **`.deb` / `.rpm` / `.apk` → `.pkg.tar.zst`** escrito em **Rust** (Edition 2024) para **Arch Linux** e distribuições derivadas baseadas no `pacman`.
 
-O `install-in-arch` lê pacotes Debian (`.deb`) e RPM (`.rpm`) diretamente em *streaming*, resolve dependências contra os repositórios configurados no `pacman`, aplica normalização *usr-merge*, gera metadados `.PKGINFO` e `.MTREE` v2 íntegros e delega a instalação, listagem e desinstalação de forma segura ao `pacman`.
+O `install-in-arch` lê pacotes Debian (`.deb`), RPM (`.rpm`) e Alpine Linux (`.apk` v2) diretamente em *streaming*, resolve dependências contra os repositórios configurados no `pacman` (com suporte a overrides manuais via `--map`), aplica normalização *usr-merge*, gera metadados `.PKGINFO` e `.MTREE` v2 íntegros, permite auditoria *read-only* de scripts de mantenedor (`--inspect-scripts`) e saída estruturada (`--json`), e delega a instalação, listagem e desinstalação de forma segura ao `pacman`.
 
 ---
 
@@ -16,25 +16,31 @@ O `install-in-arch` lê pacotes Debian (`.deb`) e RPM (`.rpm`) diretamente em *s
 - [Como funciona por baixo dos panos](#como-funciona-por-baixo-dos-panos)
 - [Arquitetura](#arquitetura)
 - [Desenvolvimento e Testes](#desenvolvimento-e-testes)
+- [Licença](#licença)
 
 ---
 
 ## Funcionalidades suportadas
 
-### Formatos suportados (`.deb` e `.rpm`)
+### Formatos suportados (`.deb`, `.rpm` e `.apk`)
 
-- **Conversão nativa em Rust** de arquivos `.deb` (`ar` com `debian-binary` 2.x, `control.tar.*` e `data.tar.*`) e `.rpm` (cabeçalhos RPM e *payload* CPIO em Rust puro) para `.pkg.tar.zst`, sem depender de ferramentas externas de conversão como `debtap` ou `rpmextract`.
+- **Conversão nativa em Rust** de arquivos `.deb` (`ar` com `debian-binary` 2.x, `control.tar.*` e `data.tar.*`), `.rpm` (cabeçalhos RPM e *payload* CPIO em Rust puro) e `.apk` do Alpine Linux (APK v2 composto por *streams* `gzip` concatenados: assinatura opcional + segmento de controle com `.PKGINFO` + segmento de dados `tar`) para `.pkg.tar.zst`, sem depender de ferramentas externas de conversão como `debtap`, `rpmextract` ou `apk-tools`.
 - **Suporte aos formatos de compressão**:
   - `.deb`: `.tar` (sem compressão), `.tar.gz`, `.tar.xz`, `.tar.zst` e `.tar.bz2` nos membros `control.tar.*` e `data.tar.*`.
   - `.rpm`: *payload* sem compressão, `gzip`, `xz`, `zstd` e `bzip2`.
-- **Resolução de dependências Debian e RPM → Arch** em camadas (tabela curada para pacotes, *paths* e *sonames* `.so` + heurística de nomes/ABI + consulta de *virtual provides* `.so`) validada em tempo real no banco local e nos repositórios do `pacman`.
+  - `.apk`: *streams* `tar.gz` concatenados (padrão APK v2, com verificação do hash SHA-256 `datahash` do segmento de dados e rejeição explícita de `.apk` Android ZIP e APK v3 ADB).
+- **Resolução de dependências Debian, RPM e Alpine → Arch** em camadas (overrides manuais `--map <SRC=DST>` com precedência máxima + catálogo curado para pacotes, *paths*, prefixos Alpine `so:`/`cmd:`/`pc:` e *sonames* `.so` + heurística de nomes/ABI + consulta de *virtual provides* `.so`) validada em tempo real no banco local e nos repositórios do `pacman`.
 - **Normalização *usr-merge*** automática de diretórios, arquivos, *symlinks* e *hardlinks* para o layout padrão do Arch Linux (`/usr/bin` e `/usr/lib`).
 - **Geração de `.PKGINFO` e `.MTREE` v2** (comprimido em gzip, com hashes MD5 e SHA-256), garantindo compatibilidade com verificações de integridade do `pacman` (`pacman -Qkk`).
 - **Ciclo completo via `pacman`**:
-  - Instalação de `.deb` ou `.rpm` local (`pacman -U`).
-  - Desinstalação por caminho `.deb`/`.rpm` ou por nome do pacote instalado (`pacman -Rs` ou `pacman -R` com `--keep-deps`).
+  - Instalação de `.deb`, `.rpm` ou `.apk` local (`pacman -U`).
+  - Desinstalação por caminho `.deb`/`.rpm`/`.apk` ou por nome do pacote instalado (`pacman -Rs` ou `pacman -R` com `--keep-deps`).
   - Listagem dos pacotes gerenciados pela ferramenta (`--list`), filtrados pelo marcador `packager = install-in-arch <install-in-arch@local>`.
-- **Modo inspeção (`--dry-run`)** e preservação opcional do pacote gerado (`--keep-pkg <DIR>`).
+- **Auditoria e automação de CLI**:
+  - Inspeção segura *read-only* de scripts de mantenedor (`--inspect-scripts`) sem conversão nem execução.
+  - Modo simulação (`--dry-run`) e preservação opcional do pacote gerado (`--keep-pkg <DIR>`).
+  - Saída estruturada em JSON (`--json`) para `--list`, `--dry-run` e `--inspect-scripts`.
+  - Geração integrada de scripts de autocompletar para shells (`--generate-completion <SHELL>`) e página de manual `roff` (`--generate-man`).
 
 ---
 
@@ -46,9 +52,22 @@ O `install-in-arch` lê pacotes Debian (`.deb`) e RPM (`.rpm`) diretamente em *s
 - **Privilégios:** `sudo` configurado (quando executado por usuário comum, o `install-in-arch` invoca `sudo pacman ...`; quando executado como `root`, invoca `pacman` diretamente).
 - **Toolchain Rust:** `rustc` e `cargo` com suporte à **Rust Edition 2024** (apenas para compilação a partir do código-fonte).
 
-### Instalação rápida via binário pré-compilado (Release)
+### Instalação rápida via pacote nativo Arch, binário pré-compilado (Release) ou AUR
 
-Baixe o binário estático Linux (`musl`, compatível com qualquer Arch Linux e derivadas independentemente da versão da `glibc`) para `x86_64` (`install-in-arch-linux-x86_64`) ou `aarch64` (`install-in-arch-linux-aarch64`) mais recente diretamente da página de [Releases](https://github.com/passella/install-in-arch/releases/latest) (também disponíveis como arquivos `install-in-arch-<TAG>-x86_64-unknown-linux-musl.tar.gz` e `install-in-arch-<TAG>-aarch64-unknown-linux-musl.tar.gz`, acompanhados de `SHA256SUMS.txt` para verificação de integridade):
+Na página de [Releases](https://github.com/passella/install-in-arch/releases/latest) são publicados os seguintes artefatos (todos cobertos por `SHA256SUMS.txt` e atestação de proveniência de build):
+
+- **Pacote nativo Arch Linux (`x86_64` e `aarch64`)**: `install-in-arch-<VER>-1-x86_64.pkg.tar.zst` e `install-in-arch-<VER>-1-aarch64.pkg.tar.zst` (já incluem o binário estático, `README.md`, licenças `LICENSE-MIT`/`LICENSE-APACHE`, autocompletar para Bash/Zsh/Fish e página de manual comprimida `install-in-arch.1.gz`):
+
+```bash
+curl -fsSLO https://github.com/passella/install-in-arch/releases/download/v1.0.0/install-in-arch-1.0.0-1-x86_64.pkg.tar.zst
+curl -fsSLO https://github.com/passella/install-in-arch/releases/download/v1.0.0/SHA256SUMS.txt
+sha256sum -c SHA256SUMS.txt --ignore-missing
+sudo pacman -U ./install-in-arch-1.0.0-1-x86_64.pkg.tar.zst
+```
+
+*(Em sistemas ARM64, substitua `install-in-arch-1.0.0-1-x86_64.pkg.tar.zst` por `install-in-arch-1.0.0-1-aarch64.pkg.tar.zst`.)*
+
+- **Binário estático Linux (`musl`)** para `x86_64` (`install-in-arch-linux-x86_64`) ou `aarch64` (`install-in-arch-linux-aarch64`), compatível com qualquer Arch Linux e derivadas independentemente da versão da `glibc` (também disponíveis como arquivos `install-in-arch-<TAG>-x86_64-unknown-linux-musl.tar.gz` e `install-in-arch-<TAG>-aarch64-unknown-linux-musl.tar.gz`, além dos artefatos avulsos `install-in-arch.bash`, `_install-in-arch`, `install-in-arch.fish` e `install-in-arch.1.gz`):
 
 ```bash
 curl -fsSLO https://github.com/passella/install-in-arch/releases/latest/download/install-in-arch-linux-x86_64
@@ -58,6 +77,8 @@ sudo install -Dm755 install-in-arch-linux-x86_64 /usr/local/bin/install-in-arch
 ```
 
 *(Em sistemas ARM64, substitua `install-in-arch-linux-x86_64` por `install-in-arch-linux-aarch64`.)*
+
+- **Template AUR (`PKGBUILD`)**: o repositório inclui o modelo [`packaging/aur/PKGBUILD`](packaging/aur/PKGBUILD) (`install-in-arch-bin`) com sentinelas fail-closed para empacotamento local com `makepkg` após preencher os hashes de `SHA256SUMS.txt`, e cada Release também publica um `PKGBUILD` já preenchido e verificado com os SHA-256 oficiais.
 
 ### Instalação a partir do código-fonte
 
@@ -89,10 +110,13 @@ install-in-arch [OPÇÕES] [TARGET]
 
 | Opção / Argumento | Descrição |
 | --- | --- |
-| `<TARGET>` | Caminho para o arquivo `.deb` ou `.rpm` (ou nome do pacote instalado quando usado com `-u`/`--uninstall`). Obrigatório, exceto ao usar `--list`. |
-| `-u`, `--uninstall` | Desinstala o pacote (aceita o caminho do `.deb`/`.rpm` original ou o nome do pacote instalado). Conflita com `--list`. |
+| `<TARGET>` | Caminho para o arquivo `.deb`, `.rpm` ou `.apk` (ou nome do pacote instalado quando usado com `-u`/`--uninstall`). Obrigatório, exceto ao usar `--list`, `--generate-completion` ou `--generate-man`. |
+| `-u`, `--uninstall` | Desinstala o pacote (aceita o caminho do `.deb`/`.rpm`/`.apk` original ou o nome do pacote instalado). Conflita com `--list`, `--inspect-scripts` e `--map`. |
 | `--list` | Lista os pacotes instalados gerenciados pelo `install-in-arch`. |
-| `--ignore-deps` | Omite todas as entradas `depend` do `.PKGINFO` gerado. Conflita com `--strict-deps`. |
+| `--inspect-scripts` | Modo *read-only* (zero execução): extrai, sanitiza e imprime os scripts de mantenedor do pacote `.deb`, `.rpm` ou `.apk` e encerra com código `0` sem converter nem instalar nada (tem precedência sobre `--dry-run` e flags de conversão; conflita com `--list`, `-u` e `--map`). |
+| `--json` | Emite saída JSON estruturada em `stdout` (em modo JSON, avisos são incluídos no array `"warnings"` em vez de `stderr`). Válido apenas em conjunto com `--list`, `--dry-run` ou `--inspect-scripts`. |
+| `--map <SRC=DST>` | Define override manual de dependência com precedência máxima (repetível, ex.: `--map libssl3=openssl`). `SRC` é o nome da dependência de origem (insensível a maiúsculas/minúsculas, após remoção de restrição de versão) e `DST` é o nome válido do pacote Arch usado literalmente em `depend` no `.PKGINFO` (sem consulta ao `pacman`). Duplicar o mesmo `SRC` com `DST` diferente resulta em erro. Conflita com `--list`, `-u`, `--ignore-deps` e `--inspect-scripts`. |
+| `--ignore-deps` | Omite todas as entradas `depend` do `.PKGINFO` gerado. Conflita com `--strict-deps` e `--map`. |
 | `--strict-deps` | Falha imediatamente se qualquer dependência do pacote de origem não puder ser mapeada para um pacote existente no Arch. Conflita com `--ignore-deps`. |
 | `--dry-run` | Converte e inspeciona o pacote (ou valida a desinstalação) sem executar `pacman -U`, `pacman -Rs` ou `pacman -R`, exibindo o comando que seria executado. |
 | `--keep-pkg <DIR>` | Salva o arquivo `.pkg.tar.zst` gerado dentro de `<DIR>` em vez de removê-lo com o diretório temporário após a execução. |
@@ -102,16 +126,19 @@ install-in-arch [OPÇÕES] [TARGET]
 | `--allow-suid` | Preserva bits `SUID`/`SGID` (`0o6000`) nos arquivos convertidos em vez de removê-los (mantém aviso em `stderr`; o bit `world-writable` continua sendo sempre removido). |
 | `--max-uncompressed-size <SIZE>` | Cota máxima de bytes descomprimidos do *payload* (suporta sufixos `K`, `M`, `G`, `KiB`, `MiB`, `GiB`, `KB`, `MB`, `GB`; padrão: `4 GiB`). |
 | `--staging-dir <DIR>` | Diretório temporário para *staging* em disco durante a conversão (padrão: `$XDG_CACHE_HOME/install-in-arch` ou diretório temporário do sistema). |
+| `--generate-completion <SHELL>` | Imprime o script de autocompletar para `<SHELL>` (`bash`, `zsh`, `fish`, `elvish` ou `powershell`) em `stdout` e encerra com código `0` (deve ser usado sozinho, sem `<TARGET>`). |
+| `--generate-man` | Imprime a página de manual no formato `roff` em `stdout` e encerra com código `0` (deve ser usado sozinho, sem `<TARGET>`). |
 | `-h`, `--help` | Exibe a ajuda completa da CLI. |
-| `-V`, `--version` | Exibe a versão do binário. |
+| `-V`, `--version` | Exibe a versão do binário (`1.0.0`). |
 
 ### Exemplos práticos
 
-**Instalar um pacote `.deb` ou `.rpm`:**
+**Instalar um pacote `.deb`, `.rpm` ou `.apk`:**
 
 ```bash
 install-in-arch ./meu-app_1.2.3_amd64.deb
 install-in-arch ./meu-app-1.2.3-1.x86_64.rpm
+install-in-arch ./meu-app-1.2.3-r0.apk
 ```
 
 **Instalar sem confirmação interativa do `pacman`:**
@@ -119,6 +146,22 @@ install-in-arch ./meu-app-1.2.3-1.x86_64.rpm
 ```bash
 install-in-arch -y ./meu-app_1.2.3_amd64.deb
 install-in-arch -y ./meu-app-1.2.3-1.x86_64.rpm
+install-in-arch -y ./meu-app-1.2.3-r0.apk
+```
+
+**Sobrescrever manualmente o mapeamento de dependências (`--map`):**
+
+```bash
+install-in-arch ./meu-app_1.2.3_amd64.deb --map libssl3=openssl --map libfoo2=foo-git
+install-in-arch ./meu-app-1.2.3-r0.apk --map so:libcrypto.so.3=openssl
+```
+
+**Auditar os scripts de mantenedor do pacote sem converter nem instalar (`--inspect-scripts`):**
+
+```bash
+install-in-arch --inspect-scripts ./meu-app_1.2.3_amd64.deb
+install-in-arch --inspect-scripts --json ./meu-app-1.2.3-1.x86_64.rpm
+install-in-arch --inspect-scripts ./meu-app-1.2.3-r0.apk
 ```
 
 **Simular a conversão (`--dry-run`) e salvar o `.pkg.tar.zst` para inspeção:**
@@ -126,6 +169,7 @@ install-in-arch -y ./meu-app-1.2.3-1.x86_64.rpm
 ```bash
 install-in-arch --dry-run --keep-pkg ./saida ./meu-app_1.2.3_amd64.deb
 install-in-arch --dry-run --keep-pkg ./saida ./meu-app-1.2.3-1.x86_64.rpm
+install-in-arch --dry-run --json ./meu-app-1.2.3-r0.apk
 ```
 
 **Exigir mapeamento estrito de todas as dependências (ou ignorá-las):**
@@ -135,18 +179,21 @@ install-in-arch --strict-deps ./meu-app_1.2.3_amd64.deb
 install-in-arch --ignore-deps ./meu-app-1.2.3-1.x86_64.rpm
 ```
 
-**Listar pacotes instalados gerenciados pelo `install-in-arch`:**
+**Listar pacotes instalados gerenciados pelo `install-in-arch` (texto ou JSON):**
 
 ```bash
 install-in-arch --list
+install-in-arch --list --json
 ```
 
-**Desinstalar a partir do arquivo `.deb`/`.rpm` ou pelo nome do pacote:**
+**Desinstalar a partir do arquivo `.deb`/`.rpm`/`.apk` ou pelo nome do pacote:**
 
 ```bash
 install-in-arch -u ./meu-app_1.2.3_amd64.deb
 install-in-arch -u ./meu-app-1.2.3-1.x86_64.rpm
+install-in-arch -u ./meu-app-1.2.3-r0.apk
 install-in-arch -u meu-app
+install-in-arch -u --dry-run --json meu-app
 ```
 
 **Desinstalar preservando dependências e sem prompt de confirmação:**
@@ -155,28 +202,112 @@ install-in-arch -u meu-app
 install-in-arch -u --keep-deps -y meu-app
 ```
 
+**Gerar e instalar scripts de autocompletar (`--generate-completion`) e man page (`--generate-man`):**
+
+```bash
+# Bash
+install-in-arch --generate-completion bash | sudo tee /usr/share/bash-completion/completions/install-in-arch > /dev/null
+
+# Zsh
+install-in-arch --generate-completion zsh | sudo tee /usr/share/zsh/site-functions/_install-in-arch > /dev/null
+
+# Fish
+mkdir -p ~/.config/fish/completions
+install-in-arch --generate-completion fish > ~/.config/fish/completions/install-in-arch.fish
+
+# Man page (man 1 install-in-arch)
+install-in-arch --generate-man | sudo tee /usr/share/man/man1/install-in-arch.1 > /dev/null
+```
+
+### Schemas de saída `--json`
+
+Quando `--json` é informado com `--list`, `--dry-run` ou `--inspect-scripts`, a saída em `stdout` segue os seguintes formatos:
+
+- **`--list --json`**:
+  ```json
+  {
+    "packages": [
+      {
+        "name": "meu-app",
+        "version": "1.2.3-1",
+        "architecture": "x86_64",
+        "description": "Exemplo"
+      }
+    ]
+  }
+  ```
+- **Instalação `--dry-run --json`**:
+  ```json
+  {
+    "mode": "install",
+    "dry_run": true,
+    "package": {
+      "name": "meu-app",
+      "version": "1.2.3-1",
+      "architecture": "x86_64",
+      "entries": 42,
+      "size": 1048576
+    },
+    "dependencies": ["openssl", "glibc"],
+    "unresolved_dependencies": [],
+    "maintainer_scripts": ["postinst"],
+    "saved_package": "/caminho/saida/meu-app-1.2.3-1-x86_64.pkg.tar.zst",
+    "command_preview": "sudo /usr/bin/pacman -U -- /tmp/.../meu-app-1.2.3-1-x86_64.pkg.tar.zst",
+    "warnings": []
+  }
+  ```
+- **Desinstalação `-u --dry-run --json`**:
+  ```json
+  {
+    "mode": "uninstall",
+    "dry_run": true,
+    "package": "meu-app",
+    "command_preview": "sudo /usr/bin/pacman -Rs -- meu-app",
+    "warnings": []
+  }
+  ```
+- **`--inspect-scripts --json`**:
+  ```json
+  {
+    "format": "deb",
+    "package": "meu-app",
+    "version": "1.2.3-1",
+    "scripts": [
+      {
+        "name": "postinst",
+        "interpreter": null,
+        "content": "#!/bin/sh\n..."
+      }
+    ]
+  }
+  ```
+
 ---
 
 ## Como funciona por baixo dos panos
 
-### 1. Streaming `.deb` / `.rpm` → `.pkg.tar.zst`
+### 1. Streaming `.deb` / `.rpm` / `.apk` → `.pkg.tar.zst`
 
-1. Para `.deb`, o `DebPackageAdapter` utiliza um parser interno estrito da variante *Common* `ar` (`common_ar`) em *streaming* com buffers de 64 KiB, validando `debian-binary` (`2.x`), lendo `control.tar.*` e processando `data.tar.*`. Para `.rpm`, o `RpmPackageAdapter` pré-valida os cabeçalhos binários (*Lead* + *IndexHeaders*), verifica assinaturas/digests (`verify_digests()` e `SHA256`/`SHA512` do *payload*) e lê *payload* CPIO em *streaming* via `rpm::PackageReader`, ignorando entradas `%ghost` e preservando *hardlinks* agrupados por inode sem zerar conteúdo.
+1. **Adapters por formato em *streaming*:**
+   - Para `.deb`, o `DebPackageAdapter` utiliza um parser interno estrito da variante *Common* `ar` (`common_ar`) em *streaming* com buffers de 64 KiB, validando `debian-binary` (`2.x`), lendo `control.tar.*` e processando `data.tar.*` (assinaturas não são verificadas).
+   - Para `.rpm`, o `RpmPackageAdapter` pré-valida os cabeçalhos binários (*Lead* + *IndexHeaders*), verifica assinaturas/digests (`verify_digests()` e `SHA256`/`SHA512` do *payload*) e lê o *payload* CPIO em *streaming* via `rpm::PackageReader`, ignorando entradas `%ghost` e preservando *hardlinks* agrupados por inode sem zerar conteúdo.
+   - Para `.apk`, o `ApkPackageAdapter` processa pacotes Alpine Linux **APK v2** compostos por *streams* `gzip` concatenados (segmento opcional de assinatura + segmento `control` contendo `.PKGINFO` e scripts + segmento `data` `tar`). Pacotes Android `.apk` (formato ZIP) e Alpine APK v3 (formato ADB) são detectados e rejeitados imediatamente com erro claro. Quando o `.PKGINFO` do APK contém o campo `datahash` (SHA-256 do segmento de dados), o digest é verificado de ponta a ponta; assinaturas criptográficas não são verificadas (mesmo modelo do `.deb`).
 2. Durante a leitura do *payload*, o conteúdo dos arquivos regulares é gravado sequencialmente pelo `arch_pkg_writer` em arquivos temporários em disco (`--staging-dir`, `$XDG_CACHE_HOME/install-in-arch` ou diretório temporário do sistema) enquanto os digests **MD5** e **SHA-256** são calculados em passagem única com contabilidade estrita (`checked_add`), evitando exaustão de `/tmp` (`tmpfs`) e memória RAM em pacotes grandes.
 3. Ao final, os metadados `.PKGINFO` e `.MTREE` (gerado em *streaming* e comprimido em gzip em arquivo temporário) precedem os itens do *payload* no arquivo `.tar.zst` final (`<pkgname>-<pkgver>-<arch>.pkg.tar.zst`), com propriedade normalizada para `uid=0` / `gid=0`. Com `--keep-pkg <DIR>`, o arquivo final é persistido de forma atômica via arquivo temporário seguro no mesmo diretório e `persist_noclobber` (sem sobrescrever destinos nem seguir *symlinks*).
 
-### 2. Mapeamento Debian / RPM → Arch em camadas
+### 2. Mapeamento Debian / RPM / Alpine → Arch em camadas
 
 - **Identidade e metadados:**
   - `PackageName` é normalizado em minúsculas com caracteres válidos para o `pacman`.
-  - `PackageVersion` converte `:`, `/` e espaços em `.`, preserva `pkgver-pkgrel` válido (combinando `version` e `release` do RPM) ou atribui `-1` quando não há revisão numérica/compatível com Arch.
-  - `ArchArchitecture` traduz arquiteturas Debian (`amd64` → `x86_64`, `arm64` → `aarch64`, `i386` → `i686`, `all`/`any` → `any`, `armhf` → `armv7h`, `armel` → `arm`) e RPM (`x86_64`, `aarch64`, `noarch` → `any`, `i386`/`i486`/`i586`/`i686` → `i686`, `armv7hl` → `armv7h`).
-  - Em pacotes `.rpm`, `Conflicts` e `Obsoletes` sanitizados também são convertidos para `conflict` e `replaces` no `.PKGINFO`.
-- **Resolução de dependências (`Pre-Depends` + `Depends` no `.deb`, `Requires` no `.rpm`):**
-  1. **Pré-filtragem e expressões ricas (RPM):** ignora capabilities internas (`rpmlib(...)`, `rtld(...)`, `config(...)`) e cláusulas condicionais (`(... if ...)`, `(... unless ...)`), além de tratar expressões booleanas como `(a or b)` e `(a and b)`.
-  2. **Tabela curada:** mapeia pacotes Debian/Fedora/RHEL, *paths* (`/bin/sh`, `/usr/bin/env`, `/usr/bin/python3`, `/usr/bin/perl`, `/sbin/ldconfig`, etc.) e *sonames* `.so` comuns (ex.: `libc.so.6` → `glibc`, `libstdc++.so.6` → `gcc-libs`, `libgtk-3.so.0` / `libgtk-3-0` → `gtk3`, `libwebkit2gtk-4.1.so.0` / `libwebkit2gtk-4.1-0` → `webkit2gtk-4.1`, `libasound.so.2` / `libasound2` → `alsa-lib`, `libssl.so.3` / `libssl3` → `openssl`, entre dezenas de outros).
-  3. **Heurística automática e *virtual provides* `.so`:** remove sufixos `t64`, `-libs`, versões de ABI numéricas e testa variações com/sem prefixo `lib`, além de consultar *virtual provides* `.so` diretamente no `pacman` (ex.: `libfoo.so`).
-  4. **Validação real em lote no `pacman`:** os bancos local (`pacman -Qq`), de sincronização (`pacman -Slq`), metadados (`pacman -Qi` / `pacman -Si`) e *virtual provides* `.so` são consultados com resolução em lote e cache em memória por execução, evitando amplificação de subprocessos. Dependências não mapeadas são omitidas com aviso em `stderr` (ou abortam o processo com `--strict-deps`).
+  - `PackageVersion` converte `:`, `/` e espaços em `.`, preserva `pkgver-pkgrel` válido (combinando `version` e `release` do RPM), converte sufixos de revisão Alpine `-rN` em `pkgrel` `N+1` no Arch (ex.: `1.2.3-r0` → `1.2.3-1`, `1.2.3-r4` → `1.2.3-5`) ou atribui `-1` quando não há revisão numérica/compatível com Arch.
+  - `ArchArchitecture` traduz arquiteturas Debian (`amd64` → `x86_64`, `arm64` → `aarch64`, `i386` → `i686`, `all`/`any` → `any`, `armhf` → `armv7h`, `armel` → `arm`), RPM (`x86_64`, `aarch64`, `noarch` → `any`, `i386`/`i486`/`i586`/`i686` → `i686`, `armv7hl` → `armv7h`) e Alpine (`x86_64` → `x86_64`, `aarch64` → `aarch64`, `x86` → `i686`, `armv7` → `armv7h`, `noarch` → `any`).
+  - Em pacotes `.rpm`, `Conflicts` e `Obsoletes` sanitizados são convertidos para `conflict` e `replaces` no `.PKGINFO`; em pacotes `.apk`, entradas `depend` prefixadas com `!nome` são convertidas para `conflict` e entradas `replaces` são convertidas para `replaces` no `.PKGINFO`.
+- **Resolução de dependências (`Pre-Depends` + `Depends` no `.deb`, `Requires` no `.rpm`, `depend` no `.apk`):**
+  1. **Overrides manuais (`--map <SRC=DST>`):** aplicados com precedência máxima antes do catálogo curado e das heurísticas. O nome `SRC` (insensível a maiúsculas/minúsculas, após remoção de operadores/versão, como `libssl3`, `so:libcrypto.so.3` ou `python3`) é substituído diretamente pelo pacote `DST` no `.PKGINFO` sem exigir validação nos repositórios do `pacman`.
+  2. **Pré-filtragem, expressões ricas (RPM) e sintaxe Alpine (APK):** no RPM, ignora capabilities internas (`rpmlib(...)`, `rtld(...)`, `config(...)`) e cláusulas condicionais (`(... if ...)`, `(... unless ...)`), além de tratar expressões booleanas `(a or b)` e `(a and b)`. No Alpine, interpreta prefixos `so:` (*soname* → pacote Arch, ex.: `so:libc.musl-x86_64.so.1` → `musl`, `so:libssl.so.3` → `openssl`), `cmd:` (comando) e `pc:` (*pkg-config*), operadores de versão (`>=`, `<=`, `>`, `<`, `=`, `~`), *pinning* de repositório `@tag` e conflitos `!nome`.
+  3. **Catálogo curado (`dependency_catalog`):** mapeia pacotes Debian/Fedora/RHEL/Alpine (ex.: `musl`, `busybox`, `ca-certificates`, `libgcc`/`libstdc++` → `gcc-libs`, `openssl`/`libssl3`/`libcrypto3` → `openssl`), *paths* (`/bin/sh`, `/usr/bin/env`, `/usr/bin/python3`, `/usr/bin/perl`, `/sbin/ldconfig`, etc.) e *sonames* `.so` comuns (ex.: `libc.so.6` → `glibc`, `libstdc++.so.6` → `gcc-libs`, `libgtk-3.so.0` / `libgtk-3-0` → `gtk3`, `libwebkit2gtk-4.1.so.0` / `libwebkit2gtk-4.1-0` → `webkit2gtk-4.1`, `libasound.so.2` / `libasound2` → `alsa-lib`, `libssl.so.3` / `libssl3` → `openssl`, entre dezenas de outros).
+  4. **Heurística automática e *virtual provides* `.so`:** remove sufixos `t64`, `-libs`, versões de ABI numéricas e testa variações com/sem prefixo `lib`, além de consultar *virtual provides* `.so` diretamente no `pacman` (ex.: `libfoo.so`).
+  5. **Validação real em lote no `pacman`:** os bancos local (`pacman -Qq`), de sincronização (`pacman -Slq`), metadados (`pacman -Qi` / `pacman -Si`) e *virtual provides* `.so` são consultados com resolução em lote e cache em memória por execução, evitando amplificação de subprocessos. Dependências não mapeadas são omitidas com aviso em `stderr` (ou no array `"warnings"` com `--json`, ou abortam o processo com `--strict-deps`).
 
 ### 3. Normalização *usr-merge* e consistência de árvore
 
@@ -197,13 +328,13 @@ O gerador produz um `.MTREE` v2 (`#mtree` + `/set type=file uid=0 gid=0 mode=644
 
 ### 5. Endurecimento de segurança
 
-- **Proteção de pacotes instalados e do sistema:** por padrão bloqueia a substituição ou desinstalação de pacotes cujo `Packager` não corresponda exatamente a `install-in-arch <install-in-arch@local>` ou que existam nos repositórios nativos do `pacman` (exigindo `--allow-replace-foreign`). Em RPMs, `Conflicts` e `Obsoletes` contra pacotes críticos do sistema (`glibc`, `pacman`, `systemd`, `bash`, kernel, etc.) são sempre filtrados com aviso em `stderr`, e conflitos contra pacotes de terceiros/nativos exigem `--allow-replace-foreign`.
-- **Sanitização de permissões (`SUID`/`SGID` e `world-writable`):** o bit `world-writable` (`0o0002`) é sempre removido de arquivos regulares e diretórios não *sticky*. Os bits `SUID`/`SGID` (`0o6000`) são removidos por padrão com aviso em `stderr`, podendo ser preservados apenas de forma explícita com `--allow-suid` (mantendo o aviso).
+- **Proteção de pacotes instalados e do sistema:** por padrão bloqueia a substituição ou desinstalação de pacotes cujo `Packager` não corresponda exatamente a `install-in-arch <install-in-arch@local>` ou que existam nos repositórios nativos do `pacman` (exigindo `--allow-replace-foreign`). Em RPMs e APKs, `Conflicts` (`!nome` no Alpine) e `Obsoletes` contra pacotes críticos do sistema (`glibc`, `pacman`, `systemd`, `bash`, kernel, etc.) são sempre filtrados com aviso, e conflitos contra pacotes de terceiros/nativos exigem `--allow-replace-foreign`.
+- **Sanitização de permissões (`SUID`/`SGID` e `world-writable`):** o bit `world-writable` (`0o0002`) é sempre removido de arquivos regulares e diretórios não *sticky*. Os bits `SUID`/`SGID` (`0o6000`) são removidos por padrão com aviso, podendo ser preservados apenas de forma explícita com `--allow-suid` (mantendo o aviso).
 - **Integridade na fronteira privilegiada e execução segura:** detecção de privilégios via syscall (`rustix::process::geteuid()`) sem subprocessos `id`, invocação exclusiva de caminhos absolutos confiáveis (`/usr/bin/pacman`, `/usr/bin/sudo`) com verificação de propriedade `root` e permissões seguras, e escrita atômica sem *clobber* nem *symlinks* em `--keep-pkg` / `--staging-dir`.
-- **Hardening contra DoS e malformação nos parsers:** parser *Common* `ar` próprio sem extensões GNU nem alocações guiadas por cabeçalhos; pré-validação de *headers* e limites em RPMs antes do parse completo; decodificação `XZ` limitada a 256 MiB de dicionário; proteção em entradas estendidas `tar` (`L`/`K`/`PAX` limitados a 1 MiB, rejeição de *GNU sparse*); teto `--max-uncompressed-size` (padrão `4 GiB`) e `MAX_STAGED_ENTRIES`.
+- **Hardening contra DoS e malformação nos parsers (`.deb`, `.rpm` e `.apk`):** parser *Common* `ar` próprio sem extensões GNU nem alocações guiadas por cabeçalhos; pré-validação de *headers* e limites em RPMs antes do parse completo; verificação de integridade SHA-256 `datahash` em pacotes Alpine APK v2 e rejeição imediata de Android `.apk` (ZIP) e APK v3 (ADB); decodificação `XZ` limitada a 256 MiB de dicionário; proteção em entradas estendidas `tar` (`L`/`K`/`PAX` limitados a 1 MiB, rejeição de *GNU sparse*); teto `--max-uncompressed-size` (padrão `4 GiB`) e `MAX_STAGED_ENTRIES`.
 - **Proteção contra *Path Traversal*, *dotfiles* e UTF-8 inválido:** rejeição de `..`, bytes `NUL`, caracteres BiDi/controle em caminhos, *dotfiles* arbitrários na raiz (além de `.PKGINFO`, `.MTREE`, `.BUILDINFO`, `.INSTALL`, `.CHANGELOG`), e caminhos/alvos não UTF-8 (sem substituição `lossy`).
-- **Scripts de mantenedor não executados:** `preinst`, `postinst`, `prerm` e `postrm` (no `.deb`) bem como *scriptlets* RPM (`prein`, `postin`, `preun`, `postun`, `pretrans`, `posttrans`, etc.) **não são executados nem convertidos em `.INSTALL`**; o usuário recebe um aviso explícito em `stderr`.
-- **Sanitização de metadados, argumentos e terminal:** sequências de controle ANSI (`CSI`/`OSC`/C1) e caracteres direcionais BiDi são removidos ou escapados em `--list`, avisos e `DomainError`; nomes e dependências iniciados com `-` são bloqueados; todas as invocações ao `pacman` usam separador `--`.
+- **Scripts de mantenedor nunca executados e auditoria `--inspect-scripts`:** scripts Debian (`preinst`, `postinst`, `prerm`, `postrm`, `config` em `control.tar.*`), *scriptlets* RPM (`prein`, `postin`, `preun`, `postun`, `pretrans`, `posttrans`, `preuntrans`, `postuntrans`, `verifyscript` e `triggers`, junto com seus interpretadores) e scripts Alpine (`.pre-install`, `.post-install`, `.pre-upgrade`, `.post-upgrade`, `.pre-deinstall`, `.post-deinstall`, `.trigger`) **nunca são executados nem convertidos em `.INSTALL`**; o usuário recebe um aviso explícito e pode inspecionar todo o conteúdo de forma 100% *read-only* com `--inspect-scripts`.
+- **Sanitização de metadados, scripts, argumentos e terminal:** sequências de escape ANSI (`CSI`/`OSC`/C1) são removidas, `\r` (CR) é eliminado e caracteres de controle/BiDi são escapados de forma visível (como `\u{8}`) em `--inspect-scripts`, `--list`, avisos e `DomainError`; nomes e dependências iniciados com `-` são bloqueados; todas as invocações ao `pacman` usam separador `--`.
 
 ---
 
@@ -217,17 +348,19 @@ src/
 ├── lib.rs                               # Exposição dos módulos para testes e binário
 ├── domain/                              # Hexágono central (puro, sem I/O externo)
 │   ├── mod.rs
-│   ├── models.rs                        # PackageName, PackageVersion, ArchArchitecture, SourcePackageMetadata, PkgInfoMetadata...
+│   ├── models.rs                        # PackageName, PackageVersion, ArchArchitecture, SourcePackageFormat (.deb/.rpm/.apk)...
 │   ├── error.rs                         # DomainError tipado (thiserror)
 │   ├── ports.rs                         # Driven Ports (SourcePackageInspectorPort, ArchPackageConverterPort, ...)
 │   ├── control_parser.rs                # Parser do arquivo Debian control e cláusulas de dependência
+│   ├── dependency_catalog.rs            # Catálogo estático puro de mapeamentos Debian/RPM/Alpine -> Arch
 │   ├── rpm_dependency_parser.rs         # Parser de Requires/Conflicts/Obsoletes RPM e expressões ricas
-│   ├── dependency_resolver.rs           # Resolução curada + heurística (.deb e .rpm) contra ArchPackageRepository
+│   ├── dependency_resolver.rs           # Resolução (--map + catálogo curado + heurística .deb/.rpm/.apk) contra ArchPackageRepository
 │   ├── path_normalizer.rs               # Validação de segurança, usr-merge e ajuste de symlinks/hardlinks
 │   ├── pkg_formatter.rs                 # Formatação de .PKGINFO e streaming .MTREE v2
-│   └── sanitizer.rs                     # Sanitização ANSI/BiDi/linha única e proteção de erros
+│   └── sanitizer.rs                     # Sanitização ANSI/BiDi/scripts/linha única e proteção de erros
 ├── application/                         # Casos de uso (orquestração de domínio)
 │   ├── mod.rs
+│   ├── inspect_scripts.rs               # InspectScriptsUseCase (auditoria read-only --inspect-scripts)
 │   ├── install_package.rs               # InstallPackageUseCase
 │   ├── uninstall_package.rs             # UninstallPackageUseCase
 │   └── list_packages.rs                 # ListInstalledPackagesUseCase
@@ -235,14 +368,15 @@ src/
     ├── mod.rs
     ├── inbound/                         # Driving Adapters
     │   ├── mod.rs
-    │   └── cli.rs                       # CliArgs (clap) e CliDispatcher
+    │   └── cli.rs                       # CliArgs (clap), completions, man page, --json e CliDispatcher
     └── outbound/                        # Driven Adapters
         ├── mod.rs
         ├── arch_pkg_writer.rs           # Motor compartilhado de staging em disco, permissões, árvore e .pkg.tar.zst
         ├── common_ar.rs                 # Parser interno estrito da variante Common ar
-        ├── deb_package_adapter.rs       # Streaming .deb -> ArchPackageStager (ar, tar guard, gz/xz/zst/bz2)
-        ├── rpm_package_adapter.rs       # Streaming .rpm -> ArchPackageStager (pré-validação, digests, CPIO)
-        ├── multi_format_adapter.rs      # Despacho unificado por SourcePackageFormat (.deb / .rpm)
+        ├── deb_package_adapter.rs       # Streaming .deb -> ArchPackageStager e extração read-only de scripts
+        ├── rpm_package_adapter.rs       # Streaming .rpm -> ArchPackageStager e extração read-only de scriptlets
+        ├── apk_package_adapter.rs       # Streaming .apk (APK v2) -> ArchPackageStager, datahash e extração de scripts
+        ├── multi_format_adapter.rs      # Despacho unificado por SourcePackageFormat (.deb / .rpm / .apk)
         ├── pacman_adapter.rs            # Integração segura com /usr/bin/pacman e cache em lote
         └── system_process.rs            # SystemCommandRunner (caminhos absolutos), geteuid() e SystemClock
 ```
@@ -251,7 +385,7 @@ src/
 
 ## Desenvolvimento e Testes
 
-A suíte conta com testes unitários nos módulos de domínio/adaptadores, testes de componente dos casos de uso ([`tests/use_case_component_tests.rs`](tests/use_case_component_tests.rs)), testes de integração/adversariais de conversão `.deb` ([`tests/deb_conversion_integration_tests.rs`](tests/deb_conversion_integration_tests.rs)), testes de integração/adversariais de conversão `.rpm` ([`tests/rpm_conversion_integration_tests.rs`](tests/rpm_conversion_integration_tests.rs)) e alvos de fuzzing (`cargo-fuzz`) em [`fuzz/`](fuzz/Cargo.toml) (`deb_ar_parser`, `rpm_header_parser`, `control_parser`, `rpm_dependency_parser` e `path_normalizer`).
+A suíte conta com testes unitários nos módulos de domínio/adaptadores, testes de componente dos casos de uso ([`tests/use_case_component_tests.rs`](tests/use_case_component_tests.rs)), testes de integração/adversariais de conversão `.deb` ([`tests/deb_conversion_integration_tests.rs`](tests/deb_conversion_integration_tests.rs)), `.rpm` ([`tests/rpm_conversion_integration_tests.rs`](tests/rpm_conversion_integration_tests.rs)) e `.apk`/CLI ([`tests/apk_and_cli_features_integration_tests.rs`](tests/apk_and_cli_features_integration_tests.rs)), além de alvos de fuzzing (`cargo-fuzz`) em [`fuzz/`](fuzz/Cargo.toml).
 
 Execute as verificações de formatação, lint estrito e testes com:
 
@@ -261,13 +395,23 @@ cargo clippy --all-targets -- -D warnings
 cargo test --locked
 ```
 
-Para executar os *fuzzers* (requer `cargo-fuzz` e toolchain Rust nightly):
+Para executar os *fuzzers* (requer `cargo-fuzz` e toolchain Rust nightly; executados também em rotina semanal de fuzzing contínuo no CI, incluindo o corpus *multi-stream* curado em [`fuzz/corpus/apk_parser/`](fuzz/corpus/apk_parser/)):
 
 ```bash
 cd fuzz
 cargo fuzz run deb_ar_parser
 cargo fuzz run rpm_header_parser
+cargo fuzz run apk_parser
 cargo fuzz run control_parser
 cargo fuzz run rpm_dependency_parser
 cargo fuzz run path_normalizer
 ```
+
+---
+
+## Licença
+
+Este projeto possui licenciamento duplo sob **`MIT OR Apache-2.0`**, à sua escolha:
+
+- [MIT License](LICENSE-MIT)
+- [Apache License, Version 2.0](LICENSE-APACHE)

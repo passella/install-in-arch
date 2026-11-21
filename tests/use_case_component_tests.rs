@@ -101,6 +101,7 @@ impl ArchPackageConverterPort for MockConverter {
         match format {
             SourcePackageFormat::Deb => true,
             SourcePackageFormat::Rpm => self.supports_rpm,
+            SourcePackageFormat::Apk => self.supports_rpm,
             SourcePackageFormat::Unsupported(_) => false,
         }
     }
@@ -849,6 +850,7 @@ fn list_use_case_and_cli_dispatcher_sanitize_outputs_and_parse_security_flags() 
         packager: "Arch Linux <arch@archlinux.org>".to_string(),
     });
 
+    pm.insert_managed("epic-app");
     let dispatcher = CliDispatcher::new(&inspectors, &converters, &repo, &pm, &clock);
     out.clear();
     err.clear();
@@ -908,6 +910,126 @@ fn list_use_case_and_cli_dispatcher_sanitize_outputs_and_parse_security_flags() 
         assert!(!args.allow_replace_foreign);
         assert!(!args.allow_suid);
     }
+
+    for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
+        out.clear();
+        err.clear();
+        let comp_args =
+            CliArgs::try_parse_from(["install-in-arch", "--generate-completion", shell]);
+        assert!(comp_args.is_ok(), "failed parsing shell {shell}");
+        if let Ok(args) = comp_args {
+            assert!(dispatcher.dispatch(args, &mut out, &mut err).is_ok());
+        }
+        let script = String::from_utf8_lossy(&out);
+        assert!(
+            script.contains("install-in-arch"),
+            "completion for {shell} should mention install-in-arch"
+        );
+        assert!(err.is_empty());
+    }
+
+    out.clear();
+    err.clear();
+    let man_args = CliArgs::try_parse_from(["install-in-arch", "--generate-man"]);
+    assert!(man_args.is_ok());
+    if let Ok(args) = man_args {
+        assert!(dispatcher.dispatch(args, &mut out, &mut err).is_ok());
+    }
+    let man_roff = String::from_utf8_lossy(&out);
+    assert!(man_roff.contains(".TH install-in-arch 1"));
+    assert!(
+        man_roff.contains("inspect-scripts") || man_roff.contains("inspect\\-scripts"),
+        "man page missing inspect-scripts: {man_roff}"
+    );
+    assert!(man_roff.contains("map"));
+    assert!(err.is_empty());
+
+    assert!(
+        CliArgs::try_parse_from(["install-in-arch", "--generate-completion", "bash", "a.deb"])
+            .is_err()
+    );
+    assert!(CliArgs::try_parse_from(["install-in-arch", "--generate-man", "a.deb"]).is_err());
+    assert!(CliArgs::try_parse_from(["install-in-arch", "a.deb", "--json"]).is_err());
+    assert!(CliArgs::try_parse_from(["install-in-arch", "-u", "a.deb", "--json"]).is_err());
+    assert!(
+        CliArgs::try_parse_from([
+            "install-in-arch",
+            "a.deb",
+            "--ignore-deps",
+            "--map",
+            "foo=bar"
+        ])
+        .is_err()
+    );
+    assert!(CliArgs::try_parse_from(["install-in-arch", "--list", "--map", "foo=bar"]).is_err());
+    assert!(CliArgs::try_parse_from(["install-in-arch", "-u", "foo", "--map", "foo=bar"]).is_err());
+    assert!(CliArgs::try_parse_from(["install-in-arch", "a.deb", "--map", "invalid"]).is_err());
+
+    out.clear();
+    err.clear();
+    if let Ok(args) = CliArgs::try_parse_from(["install-in-arch", "--list", "--json"]) {
+        assert!(dispatcher.dispatch(args, &mut out, &mut err).is_ok());
+    }
+    let parsed_list_json: serde_json::Value =
+        serde_json::from_slice(&out).unwrap_or(serde_json::Value::Null);
+    assert_eq!(parsed_list_json["packages"][0]["name"], "epic-app");
+    assert_eq!(
+        parsed_list_json["packages"][0]["description"],
+        "Evil Launcher"
+    );
+
+    out.clear();
+    err.clear();
+    if let Ok(args) = CliArgs::try_parse_from([
+        "install-in-arch",
+        "epic.deb",
+        "--dry-run",
+        "--json",
+        "--map",
+        "unknown-deb-lib=custom-mapped-lib",
+    ]) {
+        assert!(dispatcher.dispatch(args, &mut out, &mut err).is_ok());
+    }
+    assert!(err.is_empty());
+    let parsed_install_json: serde_json::Value =
+        serde_json::from_slice(&out).unwrap_or(serde_json::Value::Null);
+    assert_eq!(parsed_install_json["mode"], "install");
+    assert_eq!(parsed_install_json["dry_run"], true);
+    assert_eq!(parsed_install_json["package"]["name"], "epic-app");
+    assert!(
+        parsed_install_json["dependencies"].as_array().is_some_and(
+            |arr| arr.contains(&serde_json::Value::String("custom-mapped-lib".to_string()))
+        )
+    );
+
+    out.clear();
+    err.clear();
+    if let Ok(args) =
+        CliArgs::try_parse_from(["install-in-arch", "-u", "epic-app", "--dry-run", "--json"])
+    {
+        assert!(dispatcher.dispatch(args, &mut out, &mut err).is_ok());
+    }
+    let parsed_uninstall_json: serde_json::Value =
+        serde_json::from_slice(&out).unwrap_or(serde_json::Value::Null);
+    assert_eq!(parsed_uninstall_json["mode"], "uninstall");
+    assert_eq!(parsed_uninstall_json["dry_run"], true);
+    assert_eq!(parsed_uninstall_json["package"], "epic-app");
+
+    out.clear();
+    err.clear();
+    if let Ok(args) =
+        CliArgs::try_parse_from(["install-in-arch", "epic.deb", "--inspect-scripts", "--json"])
+    {
+        assert!(dispatcher.dispatch(args, &mut out, &mut err).is_ok());
+    }
+    let parsed_scripts_json: serde_json::Value =
+        serde_json::from_slice(&out).unwrap_or(serde_json::Value::Null);
+    assert_eq!(parsed_scripts_json["format"], "deb");
+    assert_eq!(parsed_scripts_json["package"], "epic-app");
+    assert_eq!(
+        parsed_scripts_json["scripts"],
+        serde_json::Value::Array(Vec::new())
+    );
 }
 
 struct ConfigurablePacmanDouble {

@@ -1,9 +1,10 @@
 use std::path::Path;
 
+use crate::adapters::outbound::apk_package_adapter::ApkPackageAdapter;
 use crate::adapters::outbound::deb_package_adapter::DebPackageAdapter;
 use crate::adapters::outbound::rpm_package_adapter::RpmPackageAdapter;
 use crate::domain::error::DomainError;
-use crate::domain::models::{SourcePackageFormat, SourcePackageMetadata};
+use crate::domain::models::{InspectedScript, SourcePackageFormat, SourcePackageMetadata};
 use crate::domain::ports::{
     ArchPackageConverterPort, PackageConversionRequest, SourcePackageInspectorPort,
     StagedArchPackage,
@@ -12,6 +13,7 @@ use crate::domain::ports::{
 pub struct MultiFormatPackageAdapter {
     deb: DebPackageAdapter,
     rpm: RpmPackageAdapter,
+    apk: ApkPackageAdapter,
 }
 
 impl MultiFormatPackageAdapter {
@@ -19,6 +21,7 @@ impl MultiFormatPackageAdapter {
         Self {
             deb: DebPackageAdapter::new(),
             rpm: RpmPackageAdapter::new(),
+            apk: ApkPackageAdapter::new(),
         }
     }
 
@@ -26,6 +29,7 @@ impl MultiFormatPackageAdapter {
         match SourcePackageFormat::from_path(path) {
             SourcePackageFormat::Deb => "deb".to_string(),
             SourcePackageFormat::Rpm => "rpm".to_string(),
+            SourcePackageFormat::Apk => "apk".to_string(),
             SourcePackageFormat::Unsupported(ext) => {
                 if ext.is_empty() {
                     path.display().to_string()
@@ -47,6 +51,7 @@ impl SourcePackageInspectorPort for MultiFormatPackageAdapter {
     fn supports(&self, format: &SourcePackageFormat) -> bool {
         SourcePackageInspectorPort::supports(&self.deb, format)
             || SourcePackageInspectorPort::supports(&self.rpm, format)
+            || SourcePackageInspectorPort::supports(&self.apk, format)
     }
 
     fn read_control_metadata(
@@ -56,6 +61,21 @@ impl SourcePackageInspectorPort for MultiFormatPackageAdapter {
         match SourcePackageFormat::from_path(source_path) {
             SourcePackageFormat::Deb => self.deb.read_control_metadata(source_path),
             SourcePackageFormat::Rpm => self.rpm.read_control_metadata(source_path),
+            SourcePackageFormat::Apk => self.apk.read_control_metadata(source_path),
+            SourcePackageFormat::Unsupported(_) => Err(DomainError::UnsupportedPackageFormat(
+                Self::format_label_from_path(source_path),
+            )),
+        }
+    }
+
+    fn read_maintainer_scripts(
+        &self,
+        source_path: &Path,
+    ) -> Result<Vec<InspectedScript>, DomainError> {
+        match SourcePackageFormat::from_path(source_path) {
+            SourcePackageFormat::Deb => self.deb.read_maintainer_scripts(source_path),
+            SourcePackageFormat::Rpm => self.rpm.read_maintainer_scripts(source_path),
+            SourcePackageFormat::Apk => self.apk.read_maintainer_scripts(source_path),
             SourcePackageFormat::Unsupported(_) => Err(DomainError::UnsupportedPackageFormat(
                 Self::format_label_from_path(source_path),
             )),
@@ -67,6 +87,7 @@ impl ArchPackageConverterPort for MultiFormatPackageAdapter {
     fn supports(&self, format: &SourcePackageFormat) -> bool {
         ArchPackageConverterPort::supports(&self.deb, format)
             || ArchPackageConverterPort::supports(&self.rpm, format)
+            || ArchPackageConverterPort::supports(&self.apk, format)
     }
 
     fn convert_to_arch_package(
@@ -76,6 +97,7 @@ impl ArchPackageConverterPort for MultiFormatPackageAdapter {
         match SourcePackageFormat::from_path(&request.source_path) {
             SourcePackageFormat::Deb => self.deb.convert_to_arch_package(request),
             SourcePackageFormat::Rpm => self.rpm.convert_to_arch_package(request),
+            SourcePackageFormat::Apk => self.apk.convert_to_arch_package(request),
             SourcePackageFormat::Unsupported(_) => Err(DomainError::UnsupportedPackageFormat(
                 Self::format_label_from_path(&request.source_path),
             )),

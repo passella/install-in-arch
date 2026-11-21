@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::error::DomainError;
 use crate::domain::models::{
-    ArchArchitecture, ConvertedArchPackage, InstalledPackageSummary, PackageName, PackageVersion,
-    SourcePackageFormat, SourcePackageMetadata,
+    ArchArchitecture, ConvertedArchPackage, InspectedScript, InstalledPackageSummary, PackageName,
+    PackageVersion, SourcePackageFormat, SourcePackageMetadata,
 };
 
 pub trait TempStorageGuard: Send {}
@@ -47,6 +47,12 @@ pub trait SourcePackageInspectorPort {
         &self,
         source_path: &Path,
     ) -> Result<SourcePackageMetadata, DomainError>;
+    fn read_maintainer_scripts(
+        &self,
+        _source_path: &Path,
+    ) -> Result<Vec<InspectedScript>, DomainError> {
+        Ok(Vec::new())
+    }
 }
 
 pub trait ArchPackageConverterPort {

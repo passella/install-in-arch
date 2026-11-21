@@ -1,18 +1,62 @@
 use std::collections::{HashMap, HashSet};
 
+pub use crate::domain::dependency_catalog::{
+    curated_apk_command_candidates, curated_apk_package_candidates,
+    curated_apk_pkgconfig_candidates, curated_arch_candidates, curated_rpm_package_candidates,
+    curated_rpm_path_candidates, curated_rpm_soname_candidates,
+};
 use crate::domain::error::DomainError;
-use crate::domain::models::{DependencyClause, ResolvedDependencies, SourcePackageFormat};
+use crate::domain::models::{
+    DependencyClause, DependencyOverride, ResolvedDependencies, SourcePackageFormat,
+};
 use crate::domain::ports::ArchPackageRepository;
 use crate::domain::rpm_dependency_parser::is_internal_rpm_capability;
 use crate::domain::sanitizer::sanitize_for_error;
 
 pub struct DependencyResolver<'a> {
     arch_repo: &'a dyn ArchPackageRepository,
+    overrides: HashMap<String, String>,
 }
 
 impl<'a> DependencyResolver<'a> {
     pub fn new(arch_repo: &'a dyn ArchPackageRepository) -> Self {
-        Self { arch_repo }
+        Self {
+            arch_repo,
+            overrides: HashMap::new(),
+        }
+    }
+
+    pub fn with_overrides(
+        arch_repo: &'a dyn ArchPackageRepository,
+        overrides: &[DependencyOverride],
+    ) -> Result<Self, DomainError> {
+        let mut map: HashMap<String, String> = HashMap::with_capacity(overrides.len());
+        for entry in overrides {
+            let src = entry.source.trim().to_ascii_lowercase();
+            let dst = entry.target.as_str().to_string();
+            if src.is_empty() || dst.is_empty() || src.starts_with('-') || dst.starts_with('-') {
+                return Err(DomainError::InvalidControlMetadata(format!(
+                    "invalid dependency override '{}={}'",
+                    sanitize_for_error(&entry.source),
+                    sanitize_for_error(entry.target.as_str())
+                )));
+            }
+            if let Some(existing) = map.get(&src)
+                && existing != &dst
+            {
+                return Err(DomainError::InvalidControlMetadata(format!(
+                    "conflicting --map overrides for '{}': '{}' vs '{}'",
+                    sanitize_for_error(&src),
+                    sanitize_for_error(existing),
+                    sanitize_for_error(&dst)
+                )));
+            }
+            map.insert(src, dst);
+        }
+        Ok(Self {
+            arch_repo,
+            overrides: map,
+        })
     }
 
     pub fn resolve(
@@ -67,12 +111,21 @@ impl<'a> DependencyResolver<'a> {
         clause: &DependencyClause,
         alt_cache: &mut HashMap<String, Option<String>>,
     ) -> Result<Option<String>, DomainError> {
+        let clause_key = clause.raw.trim().to_ascii_lowercase();
+        if let Some(overridden) = self.overrides.get(&clause_key) {
+            return Ok(Some(overridden.clone()));
+        }
+
         for alt in &clause.alternatives {
             if alt.package_name.starts_with('-') {
                 return Err(DomainError::InvalidControlMetadata(format!(
                     "dependency name cannot start with '-': '{}'",
                     sanitize_for_error(&alt.package_name)
                 )));
+            }
+
+            if let Some(overridden) = self.lookup_override(&alt.package_name, &alt.raw_clause) {
+                return Ok(Some(overridden));
             }
 
             if let Some(cached) = alt_cache.get(&alt.package_name) {
@@ -85,6 +138,7 @@ impl<'a> DependencyResolver<'a> {
             let found = match format {
                 SourcePackageFormat::Deb => self.resolve_debian_alternative(&alt.package_name)?,
                 SourcePackageFormat::Rpm => self.resolve_rpm_alternative(&alt.package_name)?,
+                SourcePackageFormat::Apk => self.resolve_apk_alternative(&alt.package_name)?,
                 SourcePackageFormat::Unsupported(_) => None,
             };
 
@@ -94,6 +148,28 @@ impl<'a> DependencyResolver<'a> {
             }
         }
         Ok(None)
+    }
+
+    fn lookup_override(&self, pkg_name: &str, raw_clause: &str) -> Option<String> {
+        if self.overrides.is_empty() {
+            return None;
+        }
+        let lower_name = pkg_name.trim().to_ascii_lowercase();
+        if let Some(mapped) = self.overrides.get(&lower_name) {
+            return Some(mapped.clone());
+        }
+        let lower_raw = raw_clause.trim().to_ascii_lowercase();
+        if let Some(mapped) = self.overrides.get(&lower_raw) {
+            return Some(mapped.clone());
+        }
+        for prefix in ["so:", "cmd:", "pc:"] {
+            if let Some(stripped) = lower_name.strip_prefix(prefix)
+                && let Some(mapped) = self.overrides.get(stripped)
+            {
+                return Some(mapped.clone());
+            }
+        }
+        None
     }
 
     fn resolve_debian_alternative(&self, deb_name: &str) -> Result<Option<String>, DomainError> {
@@ -127,33 +203,7 @@ impl<'a> DependencyResolver<'a> {
         }
 
         if let Some(so_split_idx) = find_so_marker(&lower) {
-            if let Some(curated) = curated_rpm_soname_candidates(&lower)
-                && let Some(found) = self.first_existing_candidate(curated)?
-            {
-                return Ok(Some(found));
-            }
-
-            let soname_prefix = lower.get(..so_split_idx).unwrap_or(&lower);
-            for candidate in heuristic_arch_candidates(soname_prefix) {
-                if !candidate.starts_with('-') && self.arch_repo.package_exists(&candidate)? {
-                    return Ok(Some(candidate));
-                }
-            }
-
-            if let Some(orig_so_idx) = find_so_marker(trimmed) {
-                let virtual_so = trimmed.get(..orig_so_idx + 3).unwrap_or(trimmed);
-                if !virtual_so.starts_with('-') && self.arch_repo.package_exists(virtual_so)? {
-                    return Ok(Some(virtual_so.to_string()));
-                }
-                let virtual_so_lower = virtual_so.to_ascii_lowercase();
-                if virtual_so_lower != virtual_so
-                    && !virtual_so_lower.starts_with('-')
-                    && self.arch_repo.package_exists(&virtual_so_lower)?
-                {
-                    return Ok(Some(virtual_so_lower));
-                }
-            }
-            return Ok(None);
+            return self.resolve_soname_token(trimmed, &lower, so_split_idx);
         }
 
         if let Some(curated) = curated_rpm_package_candidates(&lower)
@@ -168,6 +218,153 @@ impl<'a> DependencyResolver<'a> {
             }
         }
 
+        Ok(None)
+    }
+
+    fn resolve_apk_alternative(&self, apk_name: &str) -> Result<Option<String>, DomainError> {
+        let trimmed = apk_name.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        let lower = trimmed.to_ascii_lowercase();
+
+        if lower.starts_with('/') {
+            if let Some(curated) = curated_rpm_path_candidates(&lower) {
+                return self.first_existing_candidate(curated);
+            }
+            return Ok(None);
+        }
+
+        if let Some(so_target) = lower.strip_prefix("so:") {
+            let orig_so_target = trimmed
+                .get(3..)
+                .unwrap_or(so_target)
+                .trim_start_matches('/');
+            let clean_lower = so_target.trim_start_matches('/');
+            if clean_lower.is_empty() {
+                return Ok(None);
+            }
+            if let Some(curated) = curated_rpm_soname_candidates(clean_lower)
+                && let Some(found) = self.first_existing_candidate(curated)?
+            {
+                return Ok(Some(found));
+            }
+            if let Some(so_split_idx) = find_so_marker(clean_lower) {
+                return self.resolve_soname_token(orig_so_target, clean_lower, so_split_idx);
+            }
+            for candidate in heuristic_apk_arch_candidates(clean_lower) {
+                if !candidate.starts_with('-') && self.arch_repo.package_exists(&candidate)? {
+                    return Ok(Some(candidate));
+                }
+            }
+            return Ok(None);
+        }
+
+        if let Some(cmd_target) = lower.strip_prefix("cmd:") {
+            let clean = cmd_target.trim();
+            if clean.is_empty() {
+                return Ok(None);
+            }
+            if let Some(curated) = curated_apk_command_candidates(clean)
+                && let Some(found) = self.first_existing_candidate(curated)?
+            {
+                return Ok(Some(found));
+            }
+            for candidate in heuristic_apk_arch_candidates(clean) {
+                if !candidate.starts_with('-') && self.arch_repo.package_exists(&candidate)? {
+                    return Ok(Some(candidate));
+                }
+            }
+            return Ok(None);
+        }
+
+        if let Some(pc_target) = lower.strip_prefix("pc:") {
+            let clean = pc_target.trim();
+            if clean.is_empty() {
+                return Ok(None);
+            }
+            if let Some(curated) = curated_apk_pkgconfig_candidates(clean)
+                && let Some(found) = self.first_existing_candidate(curated)?
+            {
+                return Ok(Some(found));
+            }
+            if let Some(curated) = curated_apk_package_candidates(clean)
+                && let Some(found) = self.first_existing_candidate(curated)?
+            {
+                return Ok(Some(found));
+            }
+            for candidate in heuristic_apk_arch_candidates(clean) {
+                if !candidate.starts_with('-') && self.arch_repo.package_exists(&candidate)? {
+                    return Ok(Some(candidate));
+                }
+            }
+            return Ok(None);
+        }
+
+        if let Some(so_split_idx) = find_so_marker(&lower) {
+            return self.resolve_soname_token(trimmed, &lower, so_split_idx);
+        }
+
+        if let Some(curated) = curated_apk_package_candidates(&lower)
+            && let Some(found) = self.first_existing_candidate(curated)?
+        {
+            return Ok(Some(found));
+        }
+
+        if let Some(curated) = curated_rpm_package_candidates(&lower)
+            && let Some(found) = self.first_existing_candidate(curated)?
+        {
+            return Ok(Some(found));
+        }
+
+        if let Some(curated) = curated_arch_candidates(&lower)
+            && let Some(found) = self.first_existing_candidate(curated)?
+        {
+            return Ok(Some(found));
+        }
+
+        for candidate in heuristic_apk_arch_candidates(&lower) {
+            if !candidate.starts_with('-') && self.arch_repo.package_exists(&candidate)? {
+                return Ok(Some(candidate));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn resolve_soname_token(
+        &self,
+        orig_token: &str,
+        lower_token: &str,
+        so_split_idx: usize,
+    ) -> Result<Option<String>, DomainError> {
+        if let Some(curated) = curated_rpm_soname_candidates(lower_token)
+            && let Some(found) = self.first_existing_candidate(curated)?
+        {
+            return Ok(Some(found));
+        }
+
+        let soname_prefix = lower_token.get(..so_split_idx).unwrap_or(lower_token);
+        for candidate in heuristic_arch_candidates(soname_prefix) {
+            if !candidate.starts_with('-') && self.arch_repo.package_exists(&candidate)? {
+                return Ok(Some(candidate));
+            }
+        }
+
+        if let Some(orig_so_idx) = find_so_marker(orig_token) {
+            let virtual_so = orig_token.get(..orig_so_idx + 3).unwrap_or(orig_token);
+            if !virtual_so.starts_with('-') && self.arch_repo.package_exists(virtual_so)? {
+                return Ok(Some(virtual_so.to_string()));
+            }
+            let virtual_so_lower = virtual_so.to_ascii_lowercase();
+            if virtual_so_lower != virtual_so
+                && !virtual_so_lower.starts_with('-')
+                && self.arch_repo.package_exists(&virtual_so_lower)?
+            {
+                return Ok(Some(virtual_so_lower));
+            }
+        }
         Ok(None)
     }
 
@@ -189,219 +386,6 @@ fn find_so_marker(token: &str) -> Option<usize> {
         return Some(token.len() - 3);
     }
     None
-}
-
-pub fn curated_rpm_path_candidates(path_lower: &str) -> Option<&'static [&'static str]> {
-    match path_lower {
-        "/bin/sh" | "/usr/bin/sh" => Some(&["sh", "bash"]),
-        "/bin/bash" | "/usr/bin/bash" => Some(&["bash"]),
-        "/usr/bin/env" | "/bin/env" => Some(&["coreutils"]),
-        "/usr/bin/python3" | "/usr/bin/python" => Some(&["python"]),
-        "/usr/bin/perl" | "/bin/perl" => Some(&["perl"]),
-        "/sbin/ldconfig" | "/usr/sbin/ldconfig" | "/usr/bin/ldconfig" => Some(&["glibc"]),
-        "/usr/bin/xdg-open" => Some(&["xdg-utils"]),
-        "/bin/sed" | "/usr/bin/sed" => Some(&["sed"]),
-        "/bin/grep" | "/usr/bin/grep" => Some(&["grep"]),
-        _ => None,
-    }
-}
-
-pub fn curated_rpm_soname_candidates(soname_lower: &str) -> Option<&'static [&'static str]> {
-    match soname_lower {
-        "libc.so.6"
-        | "libm.so.6"
-        | "libpthread.so.0"
-        | "libdl.so.2"
-        | "librt.so.1"
-        | "libresolv.so.2"
-        | "libutil.so.1"
-        | "libanl.so.1"
-        | "libnsl.so.1"
-        | "ld-linux-x86-64.so.2"
-        | "ld-linux-aarch64.so.1"
-        | "ld-linux.so.2"
-        | "ld-linux-armhf.so.3" => Some(&["glibc"]),
-        "libcrypt.so.2" => Some(&["libxcrypt", "glibc"]),
-        "libcrypt.so.1" => Some(&["libxcrypt-compat", "glibc"]),
-        "libgcc_s.so.1" | "libstdc++.so.6" | "libatomic.so.1" | "libgomp.so.1" => {
-            Some(&["gcc-libs"])
-        }
-        "libgtk-3.so.0" | "libgdk-3.so.0" | "libgailutil-3.so.0" => Some(&["gtk3"]),
-        "libgtk-4.so.1" => Some(&["gtk4"]),
-        "libgtk-x11-2.0.so.0" | "libgdk-x11-2.0.so.0" => Some(&["gtk2"]),
-        "libadwaita-1.so.0" => Some(&["libadwaita"]),
-        "libwebkit2gtk-4.1.so.0" | "libjavascriptcoregtk-4.1.so.0" => Some(&["webkit2gtk-4.1"]),
-        "libwebkit2gtk-4.0.so.37" | "libjavascriptcoregtk-4.0.so.18" => {
-            Some(&["webkit2gtk-4.0", "webkit2gtk-4.1"])
-        }
-        "libayatana-appindicator3.so.1" => Some(&["libayatana-appindicator"]),
-        "libappindicator3.so.1" => Some(&["libayatana-appindicator", "libappindicator-gtk3"]),
-        "libdbusmenu-gtk3.so.4" => Some(&["libdbusmenu-gtk3"]),
-        "libdbusmenu-glib.so.4" => Some(&["libdbusmenu-glib"]),
-        "libx11.so.6" | "libx11-xcb.so.1" => Some(&["libx11"]),
-        "libxcomposite.so.1" => Some(&["libxcomposite"]),
-        "libxdamage.so.1" => Some(&["libxdamage"]),
-        "libxext.so.6" => Some(&["libxext"]),
-        "libxfixes.so.3" => Some(&["libxfixes"]),
-        "libxrandr.so.2" => Some(&["libxrandr"]),
-        "libxi.so.6" => Some(&["libxi"]),
-        "libxrender.so.1" => Some(&["libxrender"]),
-        "libxcursor.so.1" => Some(&["libxcursor"]),
-        "libxinerama.so.1" => Some(&["libxinerama"]),
-        "libxss.so.1" => Some(&["libxss"]),
-        "libxtst.so.6" => Some(&["libxtst"]),
-        "libxshmfence.so.1" => Some(&["libxshmfence"]),
-        "libxt.so.6" => Some(&["libxt"]),
-        "libxxf86vm.so.1" => Some(&["libxxf86vm"]),
-        "libice.so.6" => Some(&["libice"]),
-        "libsm.so.6" => Some(&["libsm"]),
-        "libxkbcommon.so.0" => Some(&["libxkbcommon"]),
-        "libxkbcommon-x11.so.0" => Some(&["libxkbcommon-x11"]),
-        "libxcb.so.1"
-        | "libxcb-dri3.so.0"
-        | "libxcb-glx.so.0"
-        | "libxcb-present.so.0"
-        | "libxcb-randr.so.0"
-        | "libxcb-render.so.0"
-        | "libxcb-shape.so.0"
-        | "libxcb-shm.so.0"
-        | "libxcb-sync.so.1"
-        | "libxcb-xfixes.so.0"
-        | "libxcb-xkb.so.1" => Some(&["libxcb"]),
-        "libwayland-client.so.0"
-        | "libwayland-cursor.so.0"
-        | "libwayland-egl.so.1"
-        | "libwayland-server.so.0" => Some(&["wayland"]),
-        "libnss3.so" | "libnssutil3.so" | "libsmime3.so" | "libssl3.so" => Some(&["nss"]),
-        "libnspr4.so" | "libplc4.so" | "libplds4.so" => Some(&["nspr"]),
-        "libgbm.so.1" => Some(&["mesa"]),
-        "libdrm.so.2" => Some(&["libdrm"]),
-        "libgl.so.1" | "libegl.so.1" | "libglesv2.so.2" | "libglx.so.0" | "libopengl.so.0" => {
-            Some(&["libglvnd"])
-        }
-        "libvulkan.so.1" => Some(&["vulkan-icd-loader"]),
-        "libssl.so.3" | "libcrypto.so.3" => Some(&["openssl"]),
-        "libssl.so.1.1" | "libcrypto.so.1.1" => Some(&["openssl-1.1", "openssl"]),
-        "libz.so.1" => Some(&["zlib"]),
-        "liblzma.so.5" => Some(&["xz"]),
-        "libbz2.so.1" | "libbz2.so.1.0" => Some(&["bzip2"]),
-        "libzstd.so.1" => Some(&["zstd"]),
-        "liblz4.so.1" => Some(&["lz4"]),
-        "libcurl.so.4" => Some(&["curl"]),
-        "libgnutls.so.30" => Some(&["gnutls"]),
-        "libgcrypt.so.20" => Some(&["libgcrypt"]),
-        "libgpg-error.so.0" => Some(&["libgpg-error"]),
-        "libasound.so.2" => Some(&["alsa-lib"]),
-        "libpulse.so.0" | "libpulse-simple.so.0" => Some(&["libpulse"]),
-        "libpipewire-0.3.so.0" => Some(&["libpipewire", "pipewire"]),
-        "libglib-2.0.so.0"
-        | "libgio-2.0.so.0"
-        | "libgobject-2.0.so.0"
-        | "libgmodule-2.0.so.0"
-        | "libgthread-2.0.so.0" => Some(&["glib2"]),
-        "libcairo.so.2" | "libcairo-gobject.so.2" => Some(&["cairo"]),
-        "libpango-1.0.so.0" | "libpangocairo-1.0.so.0" | "libpangoft2-1.0.so.0" => Some(&["pango"]),
-        "libatk-1.0.so.0" | "libatk-bridge-2.0.so.0" | "libatspi.so.0" => Some(&["at-spi2-core"]),
-        "libgdk_pixbuf-2.0.so.0" => Some(&["gdk-pixbuf2"]),
-        "libharfbuzz.so.0" => Some(&["harfbuzz"]),
-        "libfontconfig.so.1" => Some(&["fontconfig"]),
-        "libfreetype.so.6" => Some(&["freetype2"]),
-        "librsvg-2.so.2" => Some(&["librsvg"]),
-        "libcups.so.2" => Some(&["libcups"]),
-        "libdbus-1.so.3" => Some(&["dbus"]),
-        "libexpat.so.1" => Some(&["expat"]),
-        "libsecret-1.so.0" => Some(&["libsecret"]),
-        "libnotify.so.4" => Some(&["libnotify"]),
-        "libudev.so.1" | "libsystemd.so.0" => Some(&["systemd-libs"]),
-        "libsqlite3.so.0" => Some(&["sqlite"]),
-        "libxml2.so.2" | "libxml2.so.16" => Some(&["libxml2"]),
-        "libxslt.so.1" => Some(&["libxslt"]),
-        "libsdl2-2.0.so.0" => Some(&["sdl2", "sdl2-compat"]),
-        "libfuse.so.2" => Some(&["fuse2"]),
-        "libfuse3.so.3" | "libfuse3.so.4" => Some(&["fuse3"]),
-        "libffi.so.8" | "libffi.so.7" => Some(&["libffi"]),
-        "libuuid.so.1" => Some(&["util-linux-libs"]),
-        "libpcre2-8.so.0" | "libpcre2-16.so.0" => Some(&["pcre2"]),
-        "libpcre.so.1" => Some(&["pcre"]),
-        "libpng16.so.16" => Some(&["libpng"]),
-        "libjpeg.so.62" | "libjpeg.so.8" => Some(&["libjpeg-turbo"]),
-        "libwebp.so.7" => Some(&["libwebp"]),
-        "libtiff.so.6" | "libtiff.so.5" => Some(&["libtiff"]),
-        "libepoxy.so.0" => Some(&["libepoxy"]),
-        "libcap.so.2" => Some(&["libcap"]),
-        "libseccomp.so.2" => Some(&["libseccomp"]),
-        "libusb-1.0.so.0" => Some(&["libusb"]),
-        "libevdev.so.2" => Some(&["libevdev"]),
-        "libinput.so.10" => Some(&["libinput"]),
-        _ => None,
-    }
-}
-
-pub fn curated_rpm_package_candidates(rpm_lower: &str) -> Option<&'static [&'static str]> {
-    match rpm_lower {
-        "glibc" => Some(&["glibc"]),
-        "libstdc++" | "libgcc" => Some(&["gcc-libs"]),
-        "webkit2gtk4.1" | "webkit2gtk-4.1" => Some(&["webkit2gtk-4.1"]),
-        "webkit2gtk4.0" | "webkit2gtk3" => Some(&["webkit2gtk-4.0", "webkit2gtk-4.1"]),
-        "gtk3" => Some(&["gtk3"]),
-        "gtk4" => Some(&["gtk4"]),
-        "gtk2" => Some(&["gtk2"]),
-        "libappindicator-gtk3" => Some(&["libayatana-appindicator", "libappindicator-gtk3"]),
-        "libayatana-appindicator-gtk3" => Some(&["libayatana-appindicator"]),
-        "libdbusmenu-gtk3" => Some(&["libdbusmenu-gtk3"]),
-        "alsa-lib" => Some(&["alsa-lib"]),
-        "pulseaudio-libs" => Some(&["libpulse"]),
-        "pipewire-libs" => Some(&["libpipewire", "pipewire"]),
-        "mesa-libgbm" => Some(&["mesa"]),
-        "mesa-libgl" | "mesa-libegl" | "libglvnd" | "libglvnd-glx" | "libglvnd-egl"
-        | "libglvnd-opengl" => Some(&["libglvnd"]),
-        "openssl-libs" => Some(&["openssl"]),
-        "openssl1.1" => Some(&["openssl-1.1", "openssl"]),
-        "zlib" | "zlib-ng-compat" => Some(&["zlib"]),
-        "bzip2-libs" => Some(&["bzip2"]),
-        "xz-libs" => Some(&["xz"]),
-        "zstd-libs" | "libzstd" => Some(&["zstd"]),
-        "lz4-libs" => Some(&["lz4"]),
-        "libcurl" | "curl" => Some(&["curl"]),
-        "cups-libs" => Some(&["libcups"]),
-        "dbus-libs" => Some(&["dbus"]),
-        "systemd-libs" => Some(&["systemd-libs"]),
-        "sqlite-libs" => Some(&["sqlite"]),
-        "libx11" | "libx11-xcb" => Some(&["libx11"]),
-        "libxscrnsaver" => Some(&["libxss"]),
-        "libxcb" => Some(&["libxcb"]),
-        "libxkbcommon" => Some(&["libxkbcommon"]),
-        "libxkbcommon-x11" => Some(&["libxkbcommon-x11"]),
-        "libwayland-client" | "libwayland-cursor" | "libwayland-egl" | "libwayland-server" => {
-            Some(&["wayland"])
-        }
-        "nss" => Some(&["nss"]),
-        "nspr" => Some(&["nspr"]),
-        "atk" | "at-spi2-atk" | "at-spi2-core" => Some(&["at-spi2-core"]),
-        "gdk-pixbuf2" => Some(&["gdk-pixbuf2"]),
-        "freetype" => Some(&["freetype2"]),
-        "librsvg2" => Some(&["librsvg"]),
-        "libjpeg-turbo" => Some(&["libjpeg-turbo"]),
-        "libpng" => Some(&["libpng"]),
-        "fuse" | "fuse-libs" => Some(&["fuse2"]),
-        "fuse3-libs" => Some(&["fuse3"]),
-        "vulkan-loader" => Some(&["vulkan-icd-loader"]),
-        "sdl2" | "sdl2-compat" => Some(&["sdl2", "sdl2-compat"]),
-        "qt5-qtbase" | "qt5-qtbase-gui" => Some(&["qt5-base"]),
-        "qt5-qtsvg" => Some(&["qt5-svg"]),
-        "qt6-qtbase" | "qt6-qtbase-gui" => Some(&["qt6-base"]),
-        "qt6-qtsvg" => Some(&["qt6-svg"]),
-        "python3" => Some(&["python"]),
-        "util-linux-core" | "libuuid" => Some(&["util-linux-libs"]),
-        "desktop-file-utils" => Some(&["desktop-file-utils"]),
-        "shared-mime-info" => Some(&["shared-mime-info"]),
-        "hicolor-icon-theme" => Some(&["hicolor-icon-theme"]),
-        "ca-certificates" => Some(&["ca-certificates"]),
-        "xdg-utils" => Some(&["xdg-utils"]),
-        "bash" => Some(&["bash"]),
-        "sh" => Some(&["sh", "bash"]),
-        _ => None,
-    }
 }
 
 pub fn heuristic_rpm_arch_candidates(rpm_name: &str) -> Vec<String> {
@@ -428,137 +412,42 @@ pub fn heuristic_rpm_arch_candidates(rpm_name: &str) -> Vec<String> {
     candidates
 }
 
-pub fn curated_arch_candidates(deb_name: &str) -> Option<&'static [&'static str]> {
-    match deb_name {
-        "libwebkit2gtk-4.1-0" | "libjavascriptcoregtk-4.1-0" => Some(&["webkit2gtk-4.1"]),
-        "libwebkit2gtk-4.0-37" | "libjavascriptcoregtk-4.0-18" => {
-            Some(&["webkit2gtk-4.0", "webkit2gtk-4.1"])
-        }
-        "libgtk-3-0" | "libgtk-3-0t64" => Some(&["gtk3"]),
-        "libgtk2.0-0" => Some(&["gtk2"]),
-        "libgtk-4-1" => Some(&["gtk4"]),
-        "libadwaita-1-0" => Some(&["libadwaita"]),
-        "libayatana-appindicator3-1" | "libayatana-appindicator3-0.1" => {
-            Some(&["libayatana-appindicator"])
-        }
-        "libappindicator3-1" | "libappindicator1" => {
-            Some(&["libayatana-appindicator", "libappindicator-gtk3"])
-        }
-        "libdbusmenu-gtk3-4" => Some(&["libdbusmenu-gtk3"]),
-        "libdbusmenu-glib4" => Some(&["libdbusmenu-glib"]),
-        "libnss3" => Some(&["nss"]),
-        "libnspr4" => Some(&["nspr"]),
-        "libxss1" => Some(&["libxss"]),
-        "libxtst6" => Some(&["libxtst"]),
-        "libasound2" | "libasound2t64" => Some(&["alsa-lib"]),
-        "libsecret-1-0" => Some(&["libsecret"]),
-        "libnotify4" => Some(&["libnotify"]),
-        "libgbm1" => Some(&["mesa"]),
-        "libdrm2" => Some(&["libdrm"]),
-        "libxkbcommon0" => Some(&["libxkbcommon"]),
-        "libxkbcommon-x11-0" => Some(&["libxkbcommon-x11"]),
-        "libatk1.0-0" | "libatk-1.0-0" => Some(&["at-spi2-core", "atk"]),
-        "libatk-bridge2.0-0"
-        | "libatk-bridge-2.0-0"
-        | "libatk-bridge2.0-0t64"
-        | "libatspi2.0-0"
-        | "libatspi2.0-0t64" => Some(&["at-spi2-core"]),
-        "libcups2" | "libcups2t64" => Some(&["libcups"]),
-        "libpango-1.0-0" | "libpangocairo-1.0-0" | "libpangoft2-1.0-0" => Some(&["pango"]),
-        "libcairo2" | "libcairo-gobject2" => Some(&["cairo"]),
-        "libexpat1" => Some(&["expat"]),
-        "libdbus-1-3" => Some(&["dbus"]),
-        "libglib2.0-0" | "libglib2.0-0t64" => Some(&["glib2"]),
-        "libgdk-pixbuf-2.0-0" | "libgdk-pixbuf2.0-0" => Some(&["gdk-pixbuf2"]),
-        "libharfbuzz0b" => Some(&["harfbuzz"]),
-        "libfontconfig1" => Some(&["fontconfig"]),
-        "libfreetype6" => Some(&["freetype2"]),
-        "libcurl4" | "libcurl4t64" => Some(&["curl"]),
-        "libcurl3-gnutls" => Some(&["libcurl-gnutls", "curl"]),
-        "libssl3" | "libssl3t64" => Some(&["openssl"]),
-        "libssl1.1" => Some(&["openssl-1.1", "openssl"]),
-        "zlib1g" => Some(&["zlib"]),
-        "libfuse2" | "libfuse2t64" => Some(&["fuse2"]),
-        "libfuse3-3" | "libfuse3-4" => Some(&["fuse3"]),
-        "libstdc++6" | "libgcc-s1" | "libgcc1" => Some(&["gcc-libs"]),
-        "libc6" => Some(&["glibc"]),
-        "libx11-6" | "libx11-xcb1" => Some(&["libx11"]),
-        "libxcomposite1" => Some(&["libxcomposite"]),
-        "libxdamage1" => Some(&["libxdamage"]),
-        "libxext6" => Some(&["libxext"]),
-        "libxfixes3" => Some(&["libxfixes"]),
-        "libxrandr2" => Some(&["libxrandr"]),
-        "libxi6" => Some(&["libxi"]),
-        "libxrender1" => Some(&["libxrender"]),
-        "libxcursor1" => Some(&["libxcursor"]),
-        "libxinerama1" => Some(&["libxinerama"]),
-        "libxshmfence1" => Some(&["libxshmfence"]),
-        "libxt6" => Some(&["libxt"]),
-        "libxxf86vm1" => Some(&["libxxf86vm"]),
-        "libice6" => Some(&["libice"]),
-        "libsm6" => Some(&["libsm"]),
-        "libxcb1" | "libxcb-dri3-0" | "libxcb-glx0" | "libxcb-present1" | "libxcb-randr0"
-        | "libxcb-render0" | "libxcb-shape0" | "libxcb-shm0" | "libxcb-sync1"
-        | "libxcb-xfixes0" | "libxcb-xkb1" => Some(&["libxcb"]),
-        "libxcb-icccm4" => Some(&["xcb-util-wm"]),
-        "libxcb-image0" => Some(&["xcb-util-image"]),
-        "libxcb-keysyms1" => Some(&["xcb-util-keysyms"]),
-        "libxcb-render-util0" => Some(&["xcb-util-renderutil"]),
-        "libpulse0" => Some(&["libpulse"]),
-        "libpipewire-0.3-0" => Some(&["libpipewire", "pipewire"]),
-        "libsdl2-2.0-0" => Some(&["sdl2"]),
-        "libvulkan1" => Some(&["vulkan-icd-loader"]),
-        "libgl1" | "libgl1-mesa-glx" | "libegl1" | "libgles2" => Some(&["libglvnd"]),
-        "libwayland-client0" | "libwayland-cursor0" | "libwayland-egl1" | "libwayland-server0" => {
-            Some(&["wayland"])
-        }
-        "libsqlite3-0" => Some(&["sqlite"]),
-        "libxml2" | "libxml2t64" => Some(&["libxml2"]),
-        "libxslt1.1" => Some(&["libxslt"]),
-        "libpng16-16" | "libpng16-16t64" => Some(&["libpng"]),
-        "libjpeg-turbo8" | "libjpeg62-turbo" | "libjpeg8" => Some(&["libjpeg-turbo"]),
-        "libwebp7" | "libwebp6" => Some(&["libwebp"]),
-        "libtiff6" | "libtiff5" => Some(&["libtiff"]),
-        "librsvg2-2" | "librsvg2-common" => Some(&["librsvg"]),
-        "libpcre2-8-0" | "libpcre2-16-0" => Some(&["pcre2"]),
-        "libpcre3" => Some(&["pcre"]),
-        "liblzma5" => Some(&["xz"]),
-        "libbz2-1.0" => Some(&["bzip2"]),
-        "libzstd1" => Some(&["zstd"]),
-        "liblz4-1" => Some(&["lz4"]),
-        "libffi8" | "libffi7" => Some(&["libffi"]),
-        "libuuid1" => Some(&["util-linux-libs"]),
-        "libudev1" | "libsystemd0" => Some(&["systemd-libs"]),
-        "libusb-1.0-0" => Some(&["libusb"]),
-        "libgcrypt20" => Some(&["libgcrypt"]),
-        "libgpg-error0" => Some(&["libgpg-error"]),
-        "libgnutls30" | "libgnutls30t64" => Some(&["gnutls"]),
-        "libepoxy0" => Some(&["libepoxy"]),
-        "libcap2" => Some(&["libcap"]),
-        "libseccomp2" => Some(&["libseccomp"]),
-        "libsnappy1v5" => Some(&["snappy"]),
-        "libminizip1" | "libminizip1t64" => Some(&["minizip"]),
-        "libevdev2" => Some(&["libevdev"]),
-        "libinput10" => Some(&["libinput"]),
-        "libopenal1" => Some(&["openal"]),
-        "libgstreamer1.0-0" => Some(&["gstreamer"]),
-        "libgstreamer-plugins-base1.0-0" => Some(&["gst-plugins-base-libs", "gst-plugins-base"]),
-        "libqt5core5a" | "libqt5core5t64" | "libqt5gui5" | "libqt5widgets5" | "libqt5network5"
-        | "libqt5dbus5" => Some(&["qt5-base"]),
-        "libqt5svg5" => Some(&["qt5-svg"]),
-        "libqt6core6" | "libqt6core6t64" | "libqt6gui6" | "libqt6widgets6" | "libqt6network6"
-        | "libqt6dbus6" => Some(&["qt6-base"]),
-        "libqt6svg6" => Some(&["qt6-svg"]),
-        "python3" => Some(&["python"]),
-        "xdg-utils" => Some(&["xdg-utils"]),
-        "desktop-file-utils" => Some(&["desktop-file-utils"]),
-        "shared-mime-info" => Some(&["shared-mime-info"]),
-        "hicolor-icon-theme" => Some(&["hicolor-icon-theme"]),
-        "ca-certificates" => Some(&["ca-certificates"]),
-        "bash" => Some(&["bash"]),
-        "sh" => Some(&["sh", "bash"]),
-        _ => None,
+pub fn heuristic_apk_arch_candidates(apk_name: &str) -> Vec<String> {
+    let clean = apk_name.trim().to_ascii_lowercase();
+    if clean.is_empty() {
+        return Vec::new();
     }
+
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    for cand in heuristic_rpm_arch_candidates(&clean) {
+        push_unique(&mut candidates, &mut seen, cand);
+    }
+
+    for suffix in [
+        "-dev",
+        "-doc",
+        "-openrc",
+        "-bash-completion",
+        "-zsh-completion",
+    ] {
+        if let Some(stripped) = clean.strip_suffix(suffix)
+            && stripped.len() >= 2
+        {
+            for cand in heuristic_rpm_arch_candidates(stripped) {
+                push_unique(&mut candidates, &mut seen, cand);
+            }
+        }
+    }
+
+    if let Some(py_pkg) = clean.strip_prefix("py3-")
+        && !py_pkg.is_empty()
+    {
+        push_unique(&mut candidates, &mut seen, format!("python-{py_pkg}"));
+    }
+
+    candidates
 }
 
 pub fn heuristic_arch_candidates(deb_name: &str) -> Vec<String> {
@@ -628,13 +517,13 @@ mod tests {
 
     use crate::domain::control_parser::parse_dependency_list;
     use crate::domain::error::DomainError;
-    use crate::domain::models::SourcePackageFormat;
+    use crate::domain::models::{DependencyOverride, SourcePackageFormat};
     use crate::domain::ports::ArchPackageRepository;
     use crate::domain::rpm_dependency_parser::parse_rpm_requires;
 
     use super::{
-        DependencyResolver, curated_arch_candidates, heuristic_arch_candidates,
-        heuristic_rpm_arch_candidates,
+        DependencyResolver, curated_arch_candidates, heuristic_apk_arch_candidates,
+        heuristic_arch_candidates, heuristic_rpm_arch_candidates,
     };
 
     struct FakeRepo {
@@ -790,6 +679,10 @@ mod tests {
         ));
         assert!(matches!(
             resolver.resolve_for_format(&SourcePackageFormat::Rpm, &malicious, false, false),
+            Err(DomainError::InvalidControlMetadata(_))
+        ));
+        assert!(matches!(
+            resolver.resolve_for_format(&SourcePackageFormat::Apk, &malicious, false, false),
             Err(DomainError::InvalidControlMetadata(_))
         ));
     }
@@ -948,6 +841,36 @@ mod tests {
         let rpm_heuristics = heuristic_rpm_arch_candidates("FooBar-libs");
         assert!(rpm_heuristics.contains(&"foobar-libs".to_string()));
         assert!(rpm_heuristics.contains(&"foobar".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_overrides_take_maximum_precedence_and_reject_conflicts() -> Result<(), DomainError>
+    {
+        let repo = FakeRepo::with_packages(&["openssl"]);
+        let overrides = vec![
+            DependencyOverride::parse("libssl3=openssl-custom")?,
+            DependencyOverride::parse("missing-deb-pkg=mapped-target")?,
+        ];
+        let resolver = DependencyResolver::with_overrides(&repo, &overrides)?;
+        let clauses = parse_dependency_list("libssl3 (>= 3.0), missing-deb-pkg")?;
+        let resolved = resolver.resolve(&clauses, false, true)?;
+        assert_eq!(
+            resolved.arch_dependencies,
+            vec!["openssl-custom", "mapped-target"]
+        );
+
+        let conflicting = vec![
+            DependencyOverride::parse("libssl3=openssl-a")?,
+            DependencyOverride::parse("LIBSSL3=openssl-b")?,
+        ];
+        assert!(matches!(
+            DependencyResolver::with_overrides(&repo, &conflicting),
+            Err(DomainError::InvalidControlMetadata(_))
+        ));
+
+        let apk_heuristics = heuristic_apk_arch_candidates("py3-requests");
+        assert!(apk_heuristics.contains(&"python-requests".to_string()));
         Ok(())
     }
 }

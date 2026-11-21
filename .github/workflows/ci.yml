@@ -63,6 +63,7 @@ jobs:
       - name: Initialize pacman and install Rust toolchain
         run: |
           set -euo pipefail
+          sed -i '/^NoExtract/d' /etc/pacman.conf
           if [ ! -r /etc/pacman.d/gnupg/pubring.gpg ] || [ ! -r /etc/pacman.d/gnupg/trustdb.gpg ] || ! gpg --homedir /etc/pacman.d/gnupg --with-colons --list-secret-keys 2>/dev/null | grep '^sec:' >/dev/null; then
             pacman-key --init
             pacman-key --populate archlinux
@@ -203,10 +204,10 @@ jobs:
           ./install.sh --help >/dev/null
           ./uninstall.sh --help >/dev/null
 
-          ! ./install.sh --version '../evil' >/dev/null 2>&1
-          ! ./install.sh --prefix /. >/dev/null 2>&1
-          ! ./uninstall.sh --prefix /. >/dev/null 2>&1
-          ! ./uninstall.sh --prefix /usr >/dev/null 2>&1
+          if ./install.sh --version '../evil' >/dev/null 2>&1; then exit 1; fi
+          if ./install.sh --prefix /. >/dev/null 2>&1; then exit 1; fi
+          if ./uninstall.sh --prefix /. >/dev/null 2>&1; then exit 1; fi
+          if ./uninstall.sh --prefix /usr >/dev/null 2>&1; then exit 1; fi
 
           case "$(uname -m)" in
             x86_64|amd64) TARGET="x86_64-unknown-linux-musl" ;;
@@ -325,17 +326,17 @@ jobs:
             --method tarball \
             --prefix "${WORK_DIR}/prefix_latest" 2>"${LATEST_STDERR}"
           cat "${LATEST_STDERR}" >&2
-          ! grep -qi 'awk:' "${LATEST_STDERR}"
+          if grep -qi 'awk:' "${LATEST_STDERR}"; then exit 1; fi
           test -x "${WORK_DIR}/prefix_latest/bin/install-in-arch"
           "${WORK_DIR}/prefix_latest/bin/install-in-arch" | grep -qx 'install-in-arch 1.0.0'
           ./uninstall.sh --prefix "${WORK_DIR}/prefix_latest"
           test ! -e "${WORK_DIR}/prefix_latest/bin/install-in-arch"
 
           printf '0000000000000000000000000000000000000000000000000000000000000000  %s\n' "${ASSET}" > "${WORK_DIR}/release/SHA256SUMS.txt"
-          ! PATH="${WORK_DIR}/mock_bin:${PATH}" ./install.sh \
+          if PATH="${WORK_DIR}/mock_bin:${PATH}" ./install.sh \
             --version v1.0.0 \
             --method tarball \
-            --prefix "${WORK_DIR}/prefix_bad" >/dev/null 2>&1
+            --prefix "${WORK_DIR}/prefix_bad" >/dev/null 2>&1; then exit 1; fi
           test ! -e "${WORK_DIR}/prefix_bad/bin/install-in-arch"
           rm -rf -- "${WORK_DIR}"
           trap - EXIT

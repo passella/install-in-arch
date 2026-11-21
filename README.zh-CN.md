@@ -89,13 +89,13 @@ chmod +x install.sh
 - **Arch Linux 原生软件包（`x86_64` 与 `aarch64`）**：`install-in-arch-<VER>-1-x86_64.pkg.tar.zst` 与 `install-in-arch-<VER>-1-aarch64.pkg.tar.zst`（内置静态二进制文件、`README.md`、`LICENSE-MIT`/`LICENSE-APACHE` 许可证、Bash/Zsh/Fish 自动补全脚本及压缩手册页 `install-in-arch.1.gz`）：
 
 ```bash
-curl -fsSLO https://github.com/passella/install-in-arch/releases/download/v1.0.0/install-in-arch-1.0.0-1-x86_64.pkg.tar.zst
-curl -fsSLO https://github.com/passella/install-in-arch/releases/download/v1.0.0/SHA256SUMS.txt
+curl -fsSLO https://github.com/passella/install-in-arch/releases/download/v1.0.1/install-in-arch-1.0.1-1-x86_64.pkg.tar.zst
+curl -fsSLO https://github.com/passella/install-in-arch/releases/download/v1.0.1/SHA256SUMS.txt
 sha256sum -c SHA256SUMS.txt --ignore-missing
-sudo pacman -U ./install-in-arch-1.0.0-1-x86_64.pkg.tar.zst
+sudo pacman -U ./install-in-arch-1.0.1-1-x86_64.pkg.tar.zst
 ```
 
-*（在 ARM64 架构系统上，请将 `install-in-arch-1.0.0-1-x86_64.pkg.tar.zst` 替换为 `install-in-arch-1.0.0-1-aarch64.pkg.tar.zst`。）*
+*（在 ARM64 架构系统上，请将 `install-in-arch-1.0.1-1-x86_64.pkg.tar.zst` 替换为 `install-in-arch-1.0.1-1-aarch64.pkg.tar.zst`。）*
 
 - **Linux 静态链接二进制文件（`musl`）**：支持 `x86_64`（`install-in-arch-linux-x86_64`）与 `aarch64`（`install-in-arch-linux-aarch64`），不受 `glibc` 版本限制，兼容所有 Arch Linux 及衍生发行版（同时提供 `install-in-arch-<TAG>-x86_64-unknown-linux-musl.tar.gz` 和 `install-in-arch-<TAG>-aarch64-unknown-linux-musl.tar.gz` 归档包，以及独立的 `install-in-arch.bash`、`_install-in-arch`、`install-in-arch.fish` 和 `install-in-arch.1.gz`）：
 
@@ -159,7 +159,7 @@ install-in-arch [选项] [TARGET]
 | `--generate-completion <SHELL>` | 向 `stdout` 打印 `<SHELL>`（`bash`、`zsh`、`fish`、`elvish` 或 `powershell`）的自动补全脚本并以状态码 `0` 退出（必须单独使用，无需 `<TARGET>`）。 |
 | `--generate-man` | 向 `stdout` 打印 `roff` 格式的手册页并以状态码 `0` 退出（必须单独使用，无需 `<TARGET>`）。 |
 | `-h`, `--help` | 显示完整的 CLI 帮助信息。 |
-| `-V`, `--version` | 显示二进制文件版本（`1.0.0`）。 |
+| `-V`, `--version` | 显示二进制文件版本（`1.0.1`）。 |
 
 ### 实用示例
 

@@ -89,13 +89,13 @@ En la página de [Releases](https://github.com/passella/install-in-arch/releases
 - **Paquete nativo de Arch Linux (`x86_64` y `aarch64`)**: `install-in-arch-<VER>-1-x86_64.pkg.tar.zst` e `install-in-arch-<VER>-1-aarch64.pkg.tar.zst` (incluyen el binario estático, `README.md`, licencias `LICENSE-MIT`/`LICENSE-APACHE`, autocompletado para Bash/Zsh/Fish y página de manual comprimida `install-in-arch.1.gz`):
 
 ```bash
-curl -fsSLO https://github.com/passella/install-in-arch/releases/download/v1.0.0/install-in-arch-1.0.0-1-x86_64.pkg.tar.zst
-curl -fsSLO https://github.com/passella/install-in-arch/releases/download/v1.0.0/SHA256SUMS.txt
+curl -fsSLO https://github.com/passella/install-in-arch/releases/download/v1.0.1/install-in-arch-1.0.1-1-x86_64.pkg.tar.zst
+curl -fsSLO https://github.com/passella/install-in-arch/releases/download/v1.0.1/SHA256SUMS.txt
 sha256sum -c SHA256SUMS.txt --ignore-missing
-sudo pacman -U ./install-in-arch-1.0.0-1-x86_64.pkg.tar.zst
+sudo pacman -U ./install-in-arch-1.0.1-1-x86_64.pkg.tar.zst
 ```
 
-*(En sistemas ARM64, sustituye `install-in-arch-1.0.0-1-x86_64.pkg.tar.zst` por `install-in-arch-1.0.0-1-aarch64.pkg.tar.zst`.)*
+*(En sistemas ARM64, sustituye `install-in-arch-1.0.1-1-x86_64.pkg.tar.zst` por `install-in-arch-1.0.1-1-aarch64.pkg.tar.zst`.)*
 
 - **Binario estático para Linux (`musl`)** para `x86_64` (`install-in-arch-linux-x86_64`) o `aarch64` (`install-in-arch-linux-aarch64`), compatible con cualquier Arch Linux y distribuciones derivadas independientemente de la versión de `glibc` (también disponibles como archivos `install-in-arch-<TAG>-x86_64-unknown-linux-musl.tar.gz` e `install-in-arch-<TAG>-aarch64-unknown-linux-musl.tar.gz`, además de los artefactos individuales `install-in-arch.bash`, `_install-in-arch`, `install-in-arch.fish` e `install-in-arch.1.gz`):
 
@@ -159,7 +159,7 @@ install-in-arch [OPCIONES] [TARGET]
 | `--generate-completion <SHELL>` | Imprime el script de autocompletado para `<SHELL>` (`bash`, `zsh`, `fish`, `elvish` o `powershell`) en `stdout` y termina con código `0` (debe usarse solo, sin `<TARGET>`). |
 | `--generate-man` | Imprime la página de manual en formato `roff` en `stdout` y termina con código `0` (debe usarse solo, sin `<TARGET>`). |
 | `-h`, `--help` | Muestra la ayuda completa de la CLI. |
-| `-V`, `--version` | Muestra la versión del binario (`1.0.0`). |
+| `-V`, `--version` | Muestra la versión del binario (`1.0.1`). |
 
 ### Ejemplos prácticos
 

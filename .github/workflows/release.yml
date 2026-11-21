@@ -258,6 +258,7 @@ jobs:
           PKG_VER: ${{ needs.check.outputs.pkgver }}
         run: |
           set -euo pipefail
+          sed -i '/^NoExtract/d' /etc/pacman.conf
           chmod +x dist/install-in-arch-linux-x86_64
           ./dist/install-in-arch-linux-x86_64 --version
           ./dist/install-in-arch-linux-x86_64 --help

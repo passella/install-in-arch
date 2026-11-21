@@ -460,7 +460,7 @@ install_via_tarball() {
   if [[ ":${PATH}:" != *":${bin_dir}:"* ]]; then
     log_warn "'${bin_dir}' is not in your PATH."
     printf '  Add it to your shell configuration:\n'
-    printf '    export PATH="%s:$PATH"\n' "${bin_dir}"
+    printf "    export PATH=\"%s:\$PATH\"\n" "${bin_dir}"
   fi
 }
 

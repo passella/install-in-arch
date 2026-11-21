@@ -1,8 +1,8 @@
 # Maintainer: Paulão <passella@users.noreply.github.com>
 pkgname=install-in-arch-bin
 _pkgname=install-in-arch
-pkgver=1.0.0
-_tag=v1.0.0
+pkgver=1.0.1
+_tag=v1.0.1
 pkgrel=1
 pkgdesc='Native converter and package manager (.deb / .rpm / .apk -> .pkg.tar.zst) in Rust for Arch Linux'
 arch=('x86_64' 'aarch64')
